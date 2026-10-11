@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import aiohttp
+from aiohttp import web
 import phonenumbers
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
@@ -18,6 +19,8 @@ MACRODROID_WEBHOOK_URL = os.getenv(
     "MACRODROID_WEBHOOK_URL", 
     "http://trigger.macrodroid.com/YOUR_UNIQUE_DEVICE_UUID/telegram_bot"
 )
+# Render injects PORT dynamically (defaults to 10000)
+PORT = int(os.getenv("PORT", 10000))
 
 router = Router()
 
@@ -27,12 +30,10 @@ current_task: asyncio.Task | None = None
 
 # Intervention state for human /success or /failed commands
 user_intervention_event = asyncio.Event()
-user_intervention_result: str | None = None  # Stores 'success' or 'failed'
+user_intervention_result: str | None = None
 
 def parse_phone_number(raw_number: str):
-    """
-    Splits raw number into (country_code, national_number).
-    """
+    """Splits raw number into (country_code, national_number)."""
     cleaned = raw_number.strip()
     if not cleaned.startswith("+"):
         cleaned = "+" + cleaned
@@ -52,9 +53,7 @@ def parse_phone_number(raw_number: str):
     return cleaned[1:4], cleaned[4:]
 
 async def call_device_api(raw_number: str, payload_type: str = "check", code: str | None = None):
-    """
-    Sends country_code and national_number separately to MacroDroid via GET query params.
-    """
+    """Sends country_code and national_number to MacroDroid."""
     country_code, national_number = parse_phone_number(raw_number)
     
     url = (
@@ -69,12 +68,11 @@ async def call_device_api(raw_number: str, payload_type: str = "check", code: st
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=10) as response:
-                logger.info(f"MacroDroid webhook triggered, status: {response.status}")
+                logger.info(f"MacroDroid webhook status: {response.status}")
     except Exception as e:
         logger.error(f"Failed to reach MacroDroid webhook: {e}")
 
     await asyncio.sleep(2)
-    # Simulated response from device (Replace with actual device callback logic)
     return random.choice(["blocked", "try_again_5s", "request_code"])
 
 @router.message(Command("cancel"))
@@ -132,7 +130,6 @@ async def handle_numbers(message: Message):
         for i, num in enumerate(numbers, start=1):
             await status_msg.edit_text(f"Processing {total} numbers\n\n{i}/{total}")
 
-            # 1. Send number to device via MacroDroid Webhook
             device_res = await call_device_api(num, payload_type="check")
 
             if device_res == "blocked":
@@ -147,11 +144,9 @@ async def handle_numbers(message: Message):
             elif device_res == "request_code":
                 await message.answer(f"{num} ⚪ Code")
                 
-                # Generate random 6-digit code
                 code = f"{random.randint(0, 999999):06d}"
                 await call_device_api(num, payload_type="send_code", code=code)
 
-                # Start overall 3-minute wait timer (180 seconds)
                 wait_start = asyncio.get_event_loop().time()
                 timeout = 180
                 code_handled = False
@@ -159,7 +154,6 @@ async def handle_numbers(message: Message):
                 while (asyncio.get_event_loop().time() - wait_start) < timeout:
                     await asyncio.sleep(3)
                     
-                    # Simulated check for device feedback
                     sub_res = random.choice(["continue", "error", "blocked", "none"])
 
                     if sub_res == "blocked":
@@ -170,16 +164,13 @@ async def handle_numbers(message: Message):
                     elif sub_res == "continue":
                         await message.answer(f"{num} 🟤 Waiting")
                         
-                        # Calculate remaining timeout window for human intervention
                         elapsed = asyncio.get_event_loop().time() - wait_start
                         remaining_time = max(0.1, timeout - elapsed)
                         
-                        # Reset event & result listener
                         user_intervention_event.clear()
                         user_intervention_result = None
                         
                         try:
-                            # Wait for user to send /success or /failed before time runs out
                             await asyncio.wait_for(user_intervention_event.wait(), timeout=remaining_time)
                             
                             if user_intervention_result == "success":
@@ -188,7 +179,6 @@ async def handle_numbers(message: Message):
                                 await message.answer(f"{num} 🟠 Failed")
                                 
                         except asyncio.TimeoutError:
-                            # User didn't reply in time
                             await message.answer(f"{num} 🟠 Ended")
                             
                         code_handled = True
@@ -201,7 +191,6 @@ async def handle_numbers(message: Message):
                 if not code_handled:
                     await message.answer(f"{num} 🟠 Ended")
 
-        # Completion summary
         await message.answer(f"Processing Completed\n\n{total} number processed")
         await status_msg.edit_text(f"Processed {total} numbers\n\n{total}/{total}")
 
@@ -214,10 +203,30 @@ async def handle_numbers(message: Message):
         is_processing = False
         current_task = None
 
+# --- DUMMY WEB SERVER FOR RENDER HEALTH CHECKS ---
+async def handle_health_check(request):
+    return web.Response(text="Bot is running live!")
+
+async def start_dummy_server():
+    app = web.Application()
+    app.router.add_get("/", handle_health_check)
+    app.router.add_get("/healthz", handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Dummy HTTP Server running on port {PORT} for Render health scanner.")
+
 async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+
+    # Start dummy web server concurrently with polling
+    await start_dummy_server()
+
+    # Clear lingering updates before starting to avoid conflicts
+    await bot.delete_webhook(drop_pending_updates=True)
 
     logger.info("Bot started successfully. Polling for messages...")
     await dp.start_polling(bot)
