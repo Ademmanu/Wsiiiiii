@@ -53,8 +53,8 @@ def parse_phone_number(raw_number: str):
 
 async def call_device_api(raw_number: str, payload_type: str = "check", code: str | None = None):
     """
-    Triggers device and waits synchronously for the device to respond 
-    with its status via HTTP response text.
+    Triggers device and waits up to 3 minutes (180 seconds) 
+    for the device to complete its action and respond via HTTP.
     """
     country_code, national_number = parse_phone_number(raw_number)
     
@@ -65,12 +65,12 @@ async def call_device_api(raw_number: str, payload_type: str = "check", code: st
     if code:
         url += f"&code={code}"
 
-    logger.info(f"Triggering MacroDroid -> +{country_code} {national_number} [{payload_type}]")
+    logger.info(f"Triggering MacroDroid -> +{country_code} {national_number} [{payload_type}] (Waiting up to 3 mins for device)")
     
     try:
         async with aiohttp.ClientSession() as session:
-            # Wait up to 60 seconds for the device automation flow to finish and reply
-            async with session.get(url, timeout=60) as response:
+            # 3 minutes timeout for device execution
+            async with session.get(url, timeout=180) as response:
                 response_text = await response.text()
                 logger.info(f"Device response received: {response_text.strip()}")
                 return response_text.strip().lower()
@@ -133,7 +133,7 @@ async def handle_numbers(message: Message):
         for i, num in enumerate(numbers, start=1):
             await status_msg.edit_text(f"Processing {total} numbers\n\n{i}/{total}")
 
-            # 1. Send number to device and strictly wait for it to return status
+            # 1. Send number to device and wait up to 3 mins for device response
             device_res = await call_device_api(num, payload_type="check")
 
             if "blocked" in device_res:
@@ -145,51 +145,58 @@ async def handle_numbers(message: Message):
                 await asyncio.sleep(5)
                 continue
 
+            elif "error" in device_res:
+                await message.answer(f"{num} 🔴 Error Code")
+                continue
+
+            elif "continue" in device_res:
+                await message.answer(f"{num} 🟤 Waiting")
+                
+                # Start 3-minute manual intervention window for /success or /failed
+                timeout = 180
+                user_intervention_event.clear()
+                user_intervention_result = None
+                
+                try:
+                    await asyncio.wait_for(user_intervention_event.wait(), timeout=timeout)
+                    
+                    if user_intervention_result == "success":
+                        await message.answer(f"{num} 🟢 Success")
+                    elif user_intervention_result == "failed":
+                        await message.answer(f"{num} 🟠 Failed")
+                except asyncio.TimeoutError:
+                    await message.answer(f"{num} 🟠 Ended")
+                continue
+
             elif "request_code" in device_res:
                 await message.answer(f"{num} ⚪ Code")
                 
                 code = f"{random.randint(0, 999999):06d}"
-                # Send code and wait for device confirmation
+                # Send code and wait up to 3 mins for device confirmation response
                 code_res = await call_device_api(num, payload_type="send_code", code=code)
 
-                wait_start = asyncio.get_event_loop().time()
-                timeout = 300  # Updated to 5 minutes (300 seconds)
-                code_handled = False
+                if "blocked" in code_res:
+                    await message.answer(f"{num} ⚫ Bad")
+                    continue
+                elif "error" in code_res:
+                    await message.answer(f"{num} 🔴 Error Code")
+                    continue
 
-                while (asyncio.get_event_loop().time() - wait_start) < timeout:
-                    await asyncio.sleep(3)
+                await message.answer(f"{num} 🟤 Waiting")
+                
+                # Start 3-minute manual intervention window for /success or /failed
+                timeout = 180
+                user_intervention_event.clear()
+                user_intervention_result = None
+                
+                try:
+                    await asyncio.wait_for(user_intervention_event.wait(), timeout=timeout)
                     
-                    sub_res = code_res
-
-                    if "blocked" in sub_res:
-                        await message.answer(f"{num} ⚫ Bad")
-                        code_handled = True
-                        break
-                    
-                    # When waiting for manual intervention
-                    await message.answer(f"{num} 🟤 Waiting")
-                    
-                    elapsed = asyncio.get_event_loop().time() - wait_start
-                    remaining_time = max(0.1, timeout - elapsed)
-                    
-                    user_intervention_event.clear()
-                    user_intervention_result = None
-                    
-                    try:
-                        await asyncio.wait_for(user_intervention_event.wait(), timeout=remaining_time)
-                        
-                        if user_intervention_result == "success":
-                            await message.answer(f"{num} 🟢 Success")
-                        elif user_intervention_result == "failed":
-                            await message.answer(f"{num} 🟠 Failed")
-                            
-                    except asyncio.TimeoutError:
-                        await message.answer(f"{num} 🟠 Ended")
-                        
-                    code_handled = True
-                    break
-
-                if not code_handled:
+                    if user_intervention_result == "success":
+                        await message.answer(f"{num} 🟢 Success")
+                    elif user_intervention_result == "failed":
+                        await message.answer(f"{num} 🟠 Failed")
+                except asyncio.TimeoutError:
                     await message.answer(f"{num} 🟠 Ended")
 
         await message.answer(f"Processing Completed\n\n{total} number processed")
