@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import random
 import aiohttp
 import phonenumbers
@@ -11,22 +12,26 @@ from aiogram.types import Message
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# --- CONFIGURATION ---
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
-# Replace with your actual MacroDroid Webhook URL (or local device IP / Ngrok tunnel)
-MACRODROID_WEBHOOK_URL = "http://trigger.macrodroid.com/YOUR_UNIQUE_DEVICE_UUID/telegram_bot"
-SECONDARY_BOT_WEBHOOK_URL = "https://your-secondary-bot-webhook-url.com/api"
+# --- CONFIGURATION FROM ENVIRONMENT ---
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+MACRODROID_WEBHOOK_URL = os.getenv(
+    "MACRODROID_WEBHOOK_URL", 
+    "http://trigger.macrodroid.com/YOUR_UNIQUE_DEVICE_UUID/telegram_bot"
+)
 
 router = Router()
 
-# Global state to ensure only one processing session runs at a time
+# Global state management
 is_processing = False
 current_task: asyncio.Task | None = None
 
+# Intervention state for human /success or /failed commands
+user_intervention_event = asyncio.Event()
+user_intervention_result: str | None = None  # Stores 'success' or 'failed'
+
 def parse_phone_number(raw_number: str):
     """
-    Takes a raw number string, adds a '+' if missing, and splits 
-    it into (country_code, national_number) using phonenumbers[span_1](start_span)[span_1](end_span).
+    Splits raw number into (country_code, national_number).
     """
     cleaned = raw_number.strip()
     if not cleaned.startswith("+"):
@@ -35,13 +40,10 @@ def parse_phone_number(raw_number: str):
     try:
         parsed = phonenumbers.parse(cleaned, None)
         if phonenumbers.is_valid_number(parsed):
-            country_code = str(parsed.country_code)
-            national_number = str(parsed.national_number)
-            return country_code, national_number
+            return str(parsed.country_code), str(parsed.national_number)
     except Exception as e:
         logger.warning(f"Failed to parse {raw_number} using phonenumbers: {e}")
         
-    # Fallback heuristic if standard parsing fails
     if cleaned.startswith("+234") or cleaned.startswith("+233"):
         return cleaned[1:4], cleaned[4:]
     elif cleaned.startswith("+44"):
@@ -51,7 +53,7 @@ def parse_phone_number(raw_number: str):
 
 async def call_device_api(raw_number: str, payload_type: str = "check", code: str | None = None):
     """
-    Separates the country code from the number and sends them via GET query parameters to MacroDroid.
+    Sends country_code and national_number separately to MacroDroid via GET query params.
     """
     country_code, national_number = parse_phone_number(raw_number)
     
@@ -62,28 +64,18 @@ async def call_device_api(raw_number: str, payload_type: str = "check", code: st
     if code:
         url += f"&code={code}"
 
-    logger.info(f"Triggering MacroDroid -> Country Code: +{country_code}, Number: {national_number}, Type: {payload_type}")
+    logger.info(f"Triggering MacroDroid -> +{country_code} {national_number} [{payload_type}]")
     
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=10) as response:
                 logger.info(f"MacroDroid webhook triggered, status: {response.status}")
-                # If MacroDroid returns a response body (like 'blocked', 'try_again', etc.), you can parse it here.
-                # For now, we fallback to a simulated response or placeholder check.
     except Exception as e:
         logger.error(f"Failed to reach MacroDroid webhook: {e}")
 
-    # Simulated delay for device action execution
     await asyncio.sleep(2)
-    
-    # Mock return for testing logic flow (Replace with actual response from MacroDroid if returned)
+    # Simulated response from device (Replace with actual device callback logic)
     return random.choice(["blocked", "try_again_5s", "request_code"])
-
-async def call_secondary_bot_api(number: str, code: str):
-    """Sends number and code to the secondary bot API/webhook."""
-    logger.info(f"Sending to secondary bot: Number={number}, Code={code}")
-    await asyncio.sleep(1)
-    return random.choice(["success", "failed"])
 
 @router.message(Command("cancel"))
 async def cancel_handler(message: Message):
@@ -95,16 +87,35 @@ async def cancel_handler(message: Message):
     else:
         await message.reply("No active processing session to cancel.")
 
+@router.message(Command("success"))
+async def success_handler(message: Message):
+    global user_intervention_result
+    if is_processing and not user_intervention_event.is_set():
+        user_intervention_result = "success"
+        user_intervention_event.set()
+        await message.reply("✅ Marked as Success.")
+    else:
+        await message.reply("No pending step requiring /success.")
+
+@router.message(Command("failed"))
+async def failed_handler(message: Message):
+    global user_intervention_result
+    if is_processing and not user_intervention_event.is_set():
+        user_intervention_result = "failed"
+        user_intervention_event.set()
+        await message.reply("❌ Marked as Failed.")
+    else:
+        await message.reply("No pending step requiring /failed.")
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_numbers(message: Message):
-    global is_processing, current_task
+    global is_processing, current_task, user_intervention_event, user_intervention_result
 
     if is_processing:
         await message.reply("⚠️ Another processing session is already running. Use /cancel to stop it first.")
         return
 
     text = message.text
-    # Split numbers by newline, comma, or spaces
     numbers = [n.strip() for n in text.replace(",", "\n").split() if n.strip()]
 
     if not numbers:
@@ -119,7 +130,6 @@ async def handle_numbers(message: Message):
         status_msg = await message.answer(f"Processing {total} numbers")
 
         for i, num in enumerate(numbers, start=1):
-            # Update live tracking on the initial message
             await status_msg.edit_text(f"Processing {total} numbers\n\n{i}/{total}")
 
             # 1. Send number to device via MacroDroid Webhook
@@ -139,18 +149,17 @@ async def handle_numbers(message: Message):
                 
                 # Generate random 6-digit code
                 code = f"{random.randint(0, 999999):06d}"
-                
-                # Send code back to device
                 await call_device_api(num, payload_type="send_code", code=code)
 
-                # Start 3-minute wait timer (180 seconds)
+                # Start overall 3-minute wait timer (180 seconds)
                 wait_start = asyncio.get_event_loop().time()
                 timeout = 180
                 code_handled = False
 
                 while (asyncio.get_event_loop().time() - wait_start) < timeout:
-                    await asyncio.sleep(5) # Poll interval
+                    await asyncio.sleep(3)
                     
+                    # Simulated check for device feedback
                     sub_res = random.choice(["continue", "error", "blocked", "none"])
 
                     if sub_res == "blocked":
@@ -161,13 +170,27 @@ async def handle_numbers(message: Message):
                     elif sub_res == "continue":
                         await message.answer(f"{num} 🟤 Waiting")
                         
-                        secondary_res = await call_secondary_bot_api(num, code)
+                        # Calculate remaining timeout window for human intervention
+                        elapsed = asyncio.get_event_loop().time() - wait_start
+                        remaining_time = max(0.1, timeout - elapsed)
                         
-                        if secondary_res == "success":
-                            await message.answer(f"{num} 🟢 Success")
-                        else:
-                            await message.answer(f"{num} 🟠 Failed")
+                        # Reset event & result listener
+                        user_intervention_event.clear()
+                        user_intervention_result = None
                         
+                        try:
+                            # Wait for user to send /success or /failed before time runs out
+                            await asyncio.wait_for(user_intervention_event.wait(), timeout=remaining_time)
+                            
+                            if user_intervention_result == "success":
+                                await message.answer(f"{num} 🟢 Success")
+                            elif user_intervention_result == "failed":
+                                await message.answer(f"{num} 🟠 Failed")
+                                
+                        except asyncio.TimeoutError:
+                            # User didn't reply in time
+                            await message.answer(f"{num} 🟠 Ended")
+                            
                         code_handled = True
                         break
 
@@ -176,7 +199,6 @@ async def handle_numbers(message: Message):
                         continue
 
                 if not code_handled:
-                    # Timeout reached
                     await message.answer(f"{num} 🟠 Ended")
 
         # Completion summary
