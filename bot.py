@@ -40,9 +40,9 @@ device_status: str | None = None
 user_intervention_event = asyncio.Event()
 user_intervention_result: str | None = None
 
-skip_event = asyncio.Event()
+skip_current_number = False
 pause_event = asyncio.Event()
-pause_event.set()  # Initially set so it's not blocked
+pause_event.set()
 
 def parse_phone_number(raw_number: str):
     """Splits raw number into (country_code, national_number)."""
@@ -91,32 +91,32 @@ async def call_device_api(raw_number: str, payload_type: str = "check", code: st
 @router.message(Command("start"))
 async def start_handler(message: Message):
     help_text = (
-        "🤖 **Telegram Guardian Bot (MacroDroid Bridge)**\n\n"
-        "Send a list of phone numbers (comma or space separated) to begin automated processing.\n\n"
-        "🛠 **Available Commands:**\n"
-        "• `/success` - Mark current number as Success 🟢\n"
-        "• `/failed` - Mark current number as Failed 🟠\n"
-        "• `/next` - Skip current number and move to the next ⏭️\n"
-        "• `/pause` - Temporarily pause processing queue ⏸️\n"
-        "• `/resume` - Resume paused processing queue ▶️\n"
-        "• `/stats` - Check current batch progress 📊\n"
-        "• `/cancel` - Stop current batch completely ❌"
+        "Telegram Guardian Bot (MacroDroid Bridge)\n\n"
+        "Send numbers to begin automation batch.\n\n"
+        "Available Commands:\n"
+        "/success - Mark current as success\n"
+        "/failed - Mark current as failed\n"
+        "/next - Skip current number\n"
+        "/pause - Pause processing queue\n"
+        "/resume - Resume processing queue\n"
+        "/stats - View current progress\n"
+        "/cancel - Abort current batch"
     )
-    await message.reply(help_text, parse_mode="Markdown")
+    await message.reply(help_text)
 
 @router.message(Command("cancel"))
 async def cancel_handler(message: Message):
-    global is_processing, current_task
+    global is_processing, current_task, skip_current_number
     if is_processing and current_task:
         current_task.cancel()
         is_processing = False
         device_event.set()
         user_intervention_event.set()
-        skip_event.set()
+        skip_current_number = True
         pause_event.set()
-        await message.reply("❌ Processing cancelled successfully.")
+        await message.reply("Batch aborted.")
     else:
-        await message.reply("No active processing session to cancel.")
+        await message.reply("No active batch running.")
 
 @router.message(Command("pause"))
 async def pause_handler(message: Message):
@@ -124,9 +124,9 @@ async def pause_handler(message: Message):
     if is_processing and not is_paused:
         is_paused = True
         pause_event.clear()
-        await message.reply("⏸️ Processing paused. Send `/resume` when ready.")
+        await message.reply("Queue paused.")
     else:
-        await message.reply("No active running session to pause.")
+        await message.reply("Nothing to pause.")
 
 @router.message(Command("resume"))
 async def resume_handler(message: Message):
@@ -134,26 +134,27 @@ async def resume_handler(message: Message):
     if is_processing and is_paused:
         is_paused = False
         pause_event.set()
-        await message.reply("▶️ Processing resumed.")
+        await message.reply("Queue resumed.")
     else:
-        await message.reply("Processing is not currently paused.")
+        await message.reply("Queue is not paused.")
 
 @router.message(Command("next"))
 async def next_handler(message: Message):
+    global skip_current_number
     if is_processing:
-        skip_event.set()
+        skip_current_number = True
         device_event.set()
         user_intervention_event.set()
-        await message.reply("⏭️ Skipping current number...")
+        await message.reply("Skipping current target...")
     else:
-        await message.reply("No active processing session.")
+        await message.reply("No active task to skip.")
 
 @router.message(Command("stats"))
 async def stats_handler(message: Message):
     if is_processing:
-        await message.reply(f"📊 **Current Status:**\nProcessing number {current_index} of {total_numbers_count}\nActive target: `{active_number}`", parse_mode="Markdown")
+        await message.reply(f"Batch Progress: {current_index}/{total_numbers_count}\nActive Target: {active_number}")
     else:
-        await message.reply("No active session running.")
+        await message.reply("No active batch metrics.")
 
 @router.message(Command("success"))
 async def success_handler(message: Message):
@@ -161,8 +162,9 @@ async def success_handler(message: Message):
     if is_processing and not user_intervention_event.is_set():
         user_intervention_result = "success"
         user_intervention_event.set()
+        await message.react([{"type": "emoji", "emoji": "🟢"}])
     else:
-        await message.reply("No pending step requiring /success.")
+        await message.reply("No pending review.")
 
 @router.message(Command("failed"))
 async def failed_handler(message: Message):
@@ -170,24 +172,25 @@ async def failed_handler(message: Message):
     if is_processing and not user_intervention_event.is_set():
         user_intervention_result = "failed"
         user_intervention_event.set()
+        await message.react([{"type": "emoji", "emoji": "🟠"}])
     else:
-        await message.reply("No pending step requiring /failed.")
+        await message.reply("No pending review.")
 
 # --- NUMBER PROCESSOR ---
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_numbers(message: Message):
-    global is_processing, current_task, device_event, device_status, user_intervention_event, user_intervention_result, skip_event, current_index, total_numbers_count, active_number
+    global is_processing, current_task, device_event, device_status, user_intervention_event, user_intervention_result, skip_current_number, current_index, total_numbers_count, active_number
 
     if is_processing:
-        await message.reply("⚠️ Another processing session is already running. Use /cancel to stop it first.")
+        await message.reply("Batch already running. Use /cancel first.")
         return
 
     text = message.text
     numbers = [n.strip() for n in text.replace(",", "\n").split() if n.strip()]
 
     if not numbers:
-        await message.reply("No valid numbers found in your message.")
+        await message.reply("No valid numbers detected.")
         return
 
     is_processing = True
@@ -195,46 +198,37 @@ async def handle_numbers(message: Message):
     current_task = asyncio.current_task()
 
     try:
-        status_msg = await message.answer(f"Processing {total_numbers_count} numbers...")
+        status_msg = await message.answer(f"Initializing batch: {total_numbers_count} targets...")
 
         for i, num in enumerate(numbers, start=1):
             current_index = i
             active_number = num
+            skip_current_number = False
 
-            # Check pause state
             await pause_event.wait()
 
-            # Check if skipped before starting number
-            if skip_event.is_set():
-                break
-
-            await status_msg.edit_text(f"Processing numbers\n\nProgress: {i}/{total_numbers_count} ({num})")
+            await status_msg.edit_text(f"Processing batch\n\nProgress: {i}/{total_numbers_count}\nTarget: {num}")
             num_msg = await message.answer(f"{num} ⏳ Checking on device...")
 
             device_event.clear()
             device_status = None
-            skip_event.clear()
 
             success = await call_device_api(num, payload_type="check")
             if not success:
                 await num_msg.edit_text(f"{num} 🔴 Error (Webhook failed)")
                 continue
 
-            # Wait for device callback (up to 3 mins) or skip/cancel
             try:
-                done, pending = await asyncio.wait(
-                    [asyncio.create_task(device_event.wait()), asyncio.create_task(skip_event.wait())],
-                    timeout=180,
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in pending:
-                    task.cancel()
-                    
-                if skip_event.is_set():
+                await asyncio.wait_for(device_event.wait(), timeout=180)
+            except asyncio.TimeoutError:
+                if skip_current_number:
                     await num_msg.edit_text(f"{num} ⏭️ Skipped")
                     continue
-            except asyncio.TimeoutError:
                 await num_msg.edit_text(f"{num} 🟠 Ended (Device timeout)")
+                continue
+
+            if skip_current_number:
+                await num_msg.edit_text(f"{num} ⏭️ Skipped")
                 continue
 
             res = (device_status or "").lower()
@@ -263,30 +257,31 @@ async def handle_numbers(message: Message):
 
                 try:
                     await asyncio.wait_for(device_event.wait(), timeout=180)
+                    if skip_current_number:
+                        await num_msg.edit_text(f"{num} ⏭️ Skipped")
+                        continue
                     res = (device_status or "").lower()
                     if "blocked" in res:
                         await num_msg.edit_text(f"{num} ⚫ Bad")
                         continue
                 except asyncio.TimeoutError:
-                    pass
+                    if skip_current_number:
+                        await num_msg.edit_text(f"{num} ⏭️ Skipped")
+                        continue
 
-            # Edit message for manual intervention window
-            await num_msg.edit_text(f"{num} 🟤 Waiting for your decision (/success, /failed, or /next)")
+            if skip_current_number:
+                await num_msg.edit_text(f"{num} ⏭️ Skipped")
+                continue
+
+            await num_msg.edit_text(f"{num} 🟤 Waiting for decision (/success, /failed, /next)")
             
             user_intervention_event.clear()
-            skip_event.clear()
             user_intervention_result = None
             
             try:
-                done, pending = await asyncio.wait(
-                    [asyncio.create_task(user_intervention_event.wait()), asyncio.create_task(skip_event.wait())],
-                    timeout=180,
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in pending:
-                    task.cancel()
-
-                if skip_event.is_set():
+                await asyncio.wait_for(user_intervention_event.wait(), timeout=180)
+                
+                if skip_current_number:
                     await num_msg.edit_text(f"{num} ⏭️ Skipped")
                     continue
                 
@@ -295,20 +290,24 @@ async def handle_numbers(message: Message):
                 elif user_intervention_result == "failed":
                     await num_msg.edit_text(f"{num} 🟠 Failed")
             except asyncio.TimeoutError:
+                if skip_current_number:
+                    await num_msg.edit_text(f"{num} ⏭️ Skipped")
+                    continue
                 await num_msg.edit_text(f"{num} 🟠 Ended (Time expired)")
 
-        await status_msg.edit_text(f"Processing Completed\n\nProcessed {total_numbers_count} numbers")
+        await status_msg.edit_text(f"Batch completed successfully.\nProcessed: {total_numbers_count}/{total_numbers_count} targets.")
 
     except asyncio.CancelledError:
         logger.info("Task was cancelled by user request.")
     except Exception as e:
         logger.error(f"Error during processing: {e}")
-        await message.answer(f"❌ An error occurred during processing: {str(e)}")
+        await message.answer(f"Critical error occurred: {str(e)}")
     finally:
         is_processing = False
         is_paused = False
         current_task = None
         active_number = None
+        skip_current_number = False
         pause_event.set()
 
 # --- WEB SERVER (RENDER HEALTH + DEVICE CALLBACKS) ---
