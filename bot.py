@@ -106,7 +106,7 @@ async def failed_handler(message: Message):
         user_intervention_event.set()
         await message.reply("❌ Marked as Failed.")
     else:
-        await message.reply("No pending step requiring /success.")
+        await message.reply("No pending step requiring /failed.")
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_numbers(message: Message):
@@ -128,67 +128,63 @@ async def handle_numbers(message: Message):
 
     try:
         total = len(numbers)
-        status_msg = await message.answer(f"Processing {total} numbers")
+        status_msg = await message.answer(f"Processing {total} numbers...")
 
         for i, num in enumerate(numbers, start=1):
-            await status_msg.edit_text(f"Processing {total} numbers\n\n{i}/{total}")
+            await status_msg.edit_text(f"Processing {total} numbers\n\nProgress: {i}/{total} ({num})")
 
-            # Reset device event for this iteration
+            # Send a dedicated message for this number that we will edit dynamically
+            num_msg = await message.answer(f"{num} ⏳ Checking on device...")
+
             device_event.clear()
             device_status = None
 
-            # 1. Trigger MacroDroid to check number
             success = await call_device_api(num, payload_type="check")
             if not success:
-                await message.answer(f"{num} 🔴 Error (Webhook failed)")
+                await num_msg.edit_text(f"{num} 🔴 Error (Webhook failed)")
                 continue
 
-            await message.answer(f"{num} ⏳ Checking on device...")
-
-            # 2. Wait up to 3 minutes (180 seconds) for the device to call back
             try:
                 await asyncio.wait_for(device_event.wait(), timeout=180)
             except asyncio.TimeoutError:
-                await message.answer(f"{num} 🟠 Ended (Device timeout)")
+                await num_msg.edit_text(f"{num} 🟠 Ended (Device timeout)")
                 continue
 
             res = (device_status or "").lower()
 
             if "blocked" in res:
-                await message.answer(f"{num} ⚫ Bad")
+                await num_msg.edit_text(f"{num} ⚫ Bad")
                 continue
 
             elif "try_again" in res:
-                await message.answer(f"{num} 🟡 in 5s")
+                await num_msg.edit_text(f"{num} 🟡 in 5s")
                 await asyncio.sleep(5)
                 continue
 
             elif "error" in res:
-                await message.answer(f"{num} 🔴 Error Code")
+                await num_msg.edit_text(f"{num} 🔴 Error Code")
                 continue
 
             elif "request_code" in res:
-                await message.answer(f"{num} ⚪ Code")
+                await num_msg.edit_text(f"{num} ⚪ Code")
                 
                 code = f"{random.randint(0, 999999):06d}"
                 device_event.clear()
                 device_status = None
 
-                # Send code to MacroDroid
                 await call_device_api(num, payload_type="send_code", code=code)
 
-                # Wait up to 3 minutes for device confirmation of code submission
                 try:
                     await asyncio.wait_for(device_event.wait(), timeout=180)
                     res = (device_status or "").lower()
                     if "blocked" in res:
-                        await message.answer(f"{num} ⚫ Bad")
+                        await num_msg.edit_text(f"{num} ⚫ Bad")
                         continue
                 except asyncio.TimeoutError:
-                    pass  # Proceed to manual window if device doesn't send a final response
+                    pass
 
-            # 3. Enter 3-minute manual intervention window (/success or /failed)
-            await message.answer(f"{num} 🟤 Waiting for your decision (/success or /failed)")
+            # Edit message for manual intervention window
+            await num_msg.edit_text(f"{num} 🟤 Waiting for your decision (/success or /failed)")
             
             user_intervention_event.clear()
             user_intervention_result = None
@@ -197,14 +193,13 @@ async def handle_numbers(message: Message):
                 await asyncio.wait_for(user_intervention_event.wait(), timeout=180)
                 
                 if user_intervention_result == "success":
-                    await message.answer(f"{num} 🟢 Success")
+                    await num_msg.edit_text(f"{num} 🟢 Success")
                 elif user_intervention_result == "failed":
-                    await message.answer(f"{num} 🟠 Failed")
+                    await num_msg.edit_text(f"{num} 🟠 Failed")
             except asyncio.TimeoutError:
-                await message.answer(f"{num} 🟠 Ended (Time expired)")
+                await num_msg.edit_text(f"{num} 🟠 Ended (Time expired)")
 
-        await message.answer(f"Processing Completed\n\n{total} number processed")
-        await status_msg.edit_text(f"Processed {total} numbers\n\n{total}/{total}")
+        await status_msg.edit_text(f"Processing Completed\n\nProcessed {total}/{total} numbers")
 
     except asyncio.CancelledError:
         logger.info("Task was cancelled by user request.")
@@ -246,7 +241,6 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Start the web server concurrently
     await start_web_server()
     await bot.delete_webhook(drop_pending_updates=True)
 
@@ -255,4 +249,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-                
