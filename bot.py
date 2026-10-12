@@ -157,7 +157,7 @@ async def handle_numbers(message: Message):
                 continue
 
             elif "try_again" in res:
-                await num_msg.edit_text(f"{num} 🟡 in 5s")
+                await num_msg.edit_text(f"{num} 🟡 Try Later")
                 await asyncio.sleep(5)
                 continue
 
