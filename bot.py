@@ -139,7 +139,7 @@ async def call_device_api(raw_number: str, payload_type: str = "check", code: st
     logger.info(f"Triggering MacroDroid -> +{country_code} {national_number} [{payload_type}]")
     
     try:
-        async context aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=10) as response:
                 logger.info(f"MacroDroid webhook triggered, status: {response.status}")
                 return True
@@ -182,7 +182,6 @@ async def setchatid_handler(message: Message):
 
 @router.message(Command("getallid"))
 async def getallid_handler(message: Message):
-    # Simplified getallid logic inspired by fordet.py
     await message.answer(
         f"📍 **Current Chat Info:**\n"
         f"• Chat ID: `{message.chat.id}`\n"
@@ -197,7 +196,6 @@ async def otpgroups_handler(message: Message):
     args = message.text.split(maxsplit=1)
     
     if len(args) > 1:
-        # Add new group: format -> Name: -10012345,-10098765
         try:
             name, gids = args[1].split(":", 1)
             async with db_pool.acquire() as conn:
@@ -284,18 +282,16 @@ async def otp_selection_callback(callback: CallbackQuery):
     if row:
         selected_otp_group[user_id] = dict(row)
         await callback.message.edit_text(f"✅ Selected OTP Group: **{group_name}**. Starting process...", parse_mode="Markdown")
-        device_event.set() # Resume execution flow
+        device_event.set()
     else:
         await callback.answer("Group not found!", show_alert=True)
 
 # --- LIVE MONITORING CHAT LISTENER FOR SUCCESS/FAILED ---
 @router.message()
 async def monitor_live_chat_messages(message: Message):
-    """Monitors incoming chat text messages for case-sensitive SUCCESS/FAILED signals."""
     text = message.text or ""
     if "SUCCESS" in text or "FAILED" in text:
         status_val = "SUCCESS" if "SUCCESS" in text else "FAILED"
-        # Match with active processing tracking if available
         for num, ev in list(live_success_failure_events.items()):
             if num in text:
                 live_success_failure_results[num] = status_val
@@ -313,7 +309,6 @@ async def handle_numbers(message: Message):
 
     user_id = message.from_user.id
     
-    # Load target chat id from DB if not loaded
     if not target_chat_id and db_pool:
         async with db_pool.acquire() as conn:
             res = await conn.fetchval("SELECT chat_id FROM bot_settings WHERE user_id = $1", user_id)
@@ -327,7 +322,6 @@ async def handle_numbers(message: Message):
         await message.answer("No valid numbers found in message.")
         return
 
-    # Fetch configured OTP groups for inline button prompt
     async with db_pool.acquire() as conn:
         groups = await conn.fetch("SELECT name FROM otp_groups_bot WHERE user_id = $1", user_id)
 
@@ -335,7 +329,6 @@ async def handle_numbers(message: Message):
         await message.answer("❌ No OTP groups found! Please configure at least one group using `/otpgroups Name: -100xxx` before sending numbers.", parse_mode="Markdown")
         return
 
-    # Ask user to pick OTP group via Inline Buttons
     keyboard_buttons = [[InlineKeyboardButton(text=g["name"], callback_data=f"sel_otp_{g['name']}")] for g in groups]
     markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     
@@ -375,7 +368,6 @@ async def handle_numbers(message: Message):
                 continue
 
             try:
-                # Updated device wait time to 5 minutes (300 seconds)[span_7](start_span)[span_7](end_span)
                 await asyncio.wait_for(device_event.wait(), timeout=300)
             except asyncio.TimeoutError:
                 if skip_current_number:
@@ -413,7 +405,6 @@ async def handle_numbers(message: Message):
                 selected_group = selected_otp_group.get(user_id, {})
                 await num_msg.edit_text(f"{num} ⚪ Requesting code via group: {selected_group.get('name', 'Default')}")
                 
-                # Pick OTP simulation or lookup from group logic
                 code = f"{random.randint(0, 999999):06d}"
                 device_event.clear()
                 device_status = None
@@ -437,15 +428,12 @@ async def handle_numbers(message: Message):
                 await log_number_status(num, "skipped")
                 continue
 
-            # When continue is received from device, forward number internally with no tag to target chat id
             await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting SUCCESS/FAILED...")
             
             if target_chat_id:
                 try:
-                    # Forward/Send message internally with no tag to target chat ID
                     forwarded_msg = await message.bot.send_message(chat_id=target_chat_id, text=num)
                     
-                    # Setup live expectation for SUCCESS/FAILED case-sensitive response
                     ev = asyncio.Event()
                     live_success_failure_events[num] = ev
                     
@@ -487,7 +475,6 @@ async def handle_health_check(request):
     return web.Response(text="Bot is running live!")
 
 async def handle_device_callback(request):
-    """Incoming webhook endpoint for MacroDroid to report status back to the bot."""
     global device_status, device_event
     status = request.query.get("status", "unknown")
     logger.info(f"Received device callback -> status: {status}")
