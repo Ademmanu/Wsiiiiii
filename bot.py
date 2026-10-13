@@ -5,6 +5,7 @@ import random
 import aiohttp
 from aiohttp import web
 import phonenumbers
+import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -19,9 +20,13 @@ MACRODROID_WEBHOOK_URL = os.getenv(
     "MACRODROID_WEBHOOK_URL", 
     "http://trigger.macrodroid.com/YOUR_UNIQUE_DEVICE_UUID/telegram_bot"
 )
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/dbname")
 PORT = int(os.getenv("PORT", 10000))
 
 router = Router()
+
+# Global DB pool
+db_pool: asyncpg.Pool | None = None
 
 # Global state management
 is_processing = False
@@ -43,6 +48,47 @@ user_intervention_result: str | None = None
 skip_current_number = False
 pause_event = asyncio.Event()
 pause_event.set()
+
+# --- DATABASE INITIALIZATION ---
+
+async def init_db():
+    """Initializes asyncpg connection pool and creates tables if they don't exist."""
+    global db_pool
+    # Render's DATABASE_URL usually starts with postgres://, asyncpg requires postgresql://
+    dsn = DATABASE_URL.replace("postgres://", "postgresql://", 1) if DATABASE_URL.startswith("postgres://") else DATABASE_URL
+    
+    try:
+        db_pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=10)
+        logger.info("Successfully connected to PostgreSQL pool.")
+        
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS number_logs (
+                    id SERIAL PRIMARY KEY,
+                    phone_number VARCHAR(32) NOT NULL,
+                    status VARCHAR(32) NOT NULL,
+                    details TEXT,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+        logger.info("Database schema verified.")
+    except Exception as e:
+        logger.error(f"Failed to initialize PostgreSQL: {e}")
+
+async def log_number_status(phone_number: str, status: str, details: str = None):
+    """Helper to log execution status for each phone number into Postgres."""
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO number_logs (phone_number, status, details) VALUES ($1, $2, $3)",
+                phone_number, status, details
+            )
+    except Exception as e:
+        logger.error(f"Failed to write log to PostgreSQL for {phone_number}: {e}")
+
+# --- HELPER FUNCTIONS ---
 
 def parse_phone_number(raw_number: str):
     """Splits raw number into (country_code, national_number)."""
@@ -86,7 +132,7 @@ async def call_device_api(raw_number: str, payload_type: str = "check", code: st
         logger.error(f"Failed to reach MacroDroid webhook: {e}")
         return False
 
-# --- COMMAND HANDLERS (STANDALONE MESSAGES, NO REPLY QUOTING) ---
+# --- COMMAND HANDLERS ---
 
 @router.message(Command("start"))
 async def start_handler(message: Message):
@@ -210,6 +256,7 @@ async def handle_numbers(message: Message):
             success = await call_device_api(num, payload_type="check")
             if not success:
                 await num_msg.edit_text(f"{num} 🔴 Error (Webhook failed)")
+                await log_number_status(num, "webhook_error")
                 continue
 
             try:
@@ -217,27 +264,33 @@ async def handle_numbers(message: Message):
             except asyncio.TimeoutError:
                 if skip_current_number:
                     await num_msg.edit_text(f"{num} ⏭️ Skipped")
+                    await log_number_status(num, "skipped")
                     continue
                 await num_msg.edit_text(f"{num} 🟠 Ended (Device timeout)")
+                await log_number_status(num, "device_timeout")
                 continue
 
             if skip_current_number:
                 await num_msg.edit_text(f"{num} ⏭️ Skipped")
+                await log_number_status(num, "skipped")
                 continue
 
             res = (device_status or "").lower()
 
             if "blocked" in res:
                 await num_msg.edit_text(f"{num} ⚫ Bad")
+                await log_number_status(num, "blocked")
                 continue
 
             elif "try_again" in res:
                 await num_msg.edit_text(f"{num} 🟡 Try Later")
+                await log_number_status(num, "try_again")
                 await asyncio.sleep(5)
                 continue
 
             elif "error" in res:
                 await num_msg.edit_text(f"{num} 🔴 Error Code")
+                await log_number_status(num, "error")
                 continue
 
             elif "request_code" in res:
@@ -253,18 +306,22 @@ async def handle_numbers(message: Message):
                     await asyncio.wait_for(device_event.wait(), timeout=180)
                     if skip_current_number:
                         await num_msg.edit_text(f"{num} ⏭️ Skipped")
+                        await log_number_status(num, "skipped")
                         continue
                     res = (device_status or "").lower()
                     if "blocked" in res:
                         await num_msg.edit_text(f"{num} ⚫ Bad")
+                        await log_number_status(num, "blocked")
                         continue
                 except asyncio.TimeoutError:
                     if skip_current_number:
                         await num_msg.edit_text(f"{num} ⏭️ Skipped")
+                        await log_number_status(num, "skipped")
                         continue
 
             if skip_current_number:
                 await num_msg.edit_text(f"{num} ⏭️ Skipped")
+                await log_number_status(num, "skipped")
                 continue
 
             await num_msg.edit_text(f"{num} 🟤 Waiting for decision (/success, /failed, /next)")
@@ -277,17 +334,22 @@ async def handle_numbers(message: Message):
                 
                 if skip_current_number:
                     await num_msg.edit_text(f"{num} ⏭️ Skipped")
+                    await log_number_status(num, "skipped")
                     continue
                 
                 if user_intervention_result == "success":
                     await num_msg.edit_text(f"{num} 🟢 Success")
+                    await log_number_status(num, "success")
                 elif user_intervention_result == "failed":
                     await num_msg.edit_text(f"{num} 🟠 Failed")
+                    await log_number_status(num, "failed")
             except asyncio.TimeoutError:
                 if skip_current_number:
                     await num_msg.edit_text(f"{num} ⏭️ Skipped")
+                    await log_number_status(num, "skipped")
                     continue
                 await num_msg.edit_text(f"{num} 🟠 Ended (Time expired)")
+                await log_number_status(num, "user_timeout")
 
         await status_msg.edit_text(f"Batch completed.\nProcessed: {total_numbers_count}/{total_numbers_count}")
 
@@ -331,6 +393,7 @@ async def start_web_server():
     logger.info(f"Web Server running on port {PORT} (Handling health checks & device callbacks).")
 
 async def main():
+    await init_db()
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
@@ -339,7 +402,12 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
 
     logger.info("Bot started successfully. Polling for messages...")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if db_pool:
+            await db_pool.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
