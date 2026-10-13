@@ -1,3 +1,4 @@
+Here is the complete, fully fixed bot.py script with the indentation error corrected:
 import asyncio
 import logging
 import os
@@ -909,7 +910,7 @@ async def getallid_category_callback(callback: CallbackQuery):
             "No logged-in user session found. Please /login to list your dialogs, or use the current chat info below."
         )
         await callback.message.reply(
-            f"📍 **Current Chat Info:**\n• Chat ID: `{callback.message.chat.id}`\n• Type: `{callback.message.chat.type}`\n• Title: `{callback.message.chat.title or callback.message.chat.f[...]
+            f"📍 **Current Chat Info:**\n• Chat ID: `{callback.message.chat.id}`\n• Type: `{callback.message.chat.type}`\n• Title: `{callback.message.chat.title or callback.message.chat.full_name}`",
             parse_mode="Markdown",
         )
         return
@@ -1165,36 +1166,36 @@ async def handle_numbers(message: Message):
                     await log_number_status(num, "device_timeout_after_code")
                     continue
 
-                result_after = (device_status or "").lower()
-                if "continue" not in result_after and "continued" not in result_after and "proceed" not in result_after:
-                    await num_msg.edit_text(f"{num} ⚠️ Device did not signal to continue. Status: `{device_status}`", parse_mode="Markdown")
-                    await log_number_status(num, "no_continue")
-                    continue
+            result_after = (device_status or "").lower()
+            if "continue" not in result_after and "continued" not in result_after and "proceed" not in result_after:
+                await num_msg.edit_text(f"{num} ⚠️ Device did not signal to continue. Status: `{device_status}`", parse_mode="Markdown")
+                await log_number_status(num, "no_continue")
+                continue
 
-                await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting SUCCESS/FAILED...")
+            await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting SUCCESS/FAILED...")
 
-                if target_chat:
+            if target_chat:
+                try:
+                    await message.bot.send_message(chat_id=target_chat, text=num)
+                    ev = asyncio.Event()
+                    live_success_failure_events[num] = ev
+
                     try:
-                        await message.bot.send_message(chat_id=target_chat, text=num)
-                        ev = asyncio.Event()
-                        live_success_failure_events[num] = ev
-
-                        try:
-                            await asyncio.wait_for(ev.wait(), timeout=300)
-                            decision = live_success_failure_results.get(num, "UNKNOWN")
-                            await num_msg.edit_text(f"{num} 🏁 Result Decided: {decision}")
-                            await log_number_status(num, decision.lower())
-                        except asyncio.TimeoutError:
-                            await num_msg.edit_text(f"{num} 🟠 Live decision timeout (No SUCCESS/FAILED received)")
-                            await log_number_status(num, "decision_timeout")
-                        finally:
-                            live_success_failure_events.pop(num, None)
-                            live_success_failure_results.pop(num, None)
-                    except Exception:
-                        logger.exception("Failed to forward to target chat %s", target_chat)
-                        await num_msg.edit_text(f"{num} ❌ Error forwarding to target chat ID.")
-                else:
-                    await num_msg.edit_text(f"{num} ⚠️ Target chat ID not set! Use /setchatid.")
+                        await asyncio.wait_for(ev.wait(), timeout=300)
+                        decision = live_success_failure_results.get(num, "UNKNOWN")
+                        await num_msg.edit_text(f"{num} 🏁 Result Decided: {decision}")
+                        await log_number_status(num, decision.lower())
+                    except asyncio.TimeoutError:
+                        await num_msg.edit_text(f"{num} 🟠 Live decision timeout (No SUCCESS/FAILED received)")
+                        await log_number_status(num, "decision_timeout")
+                    finally:
+                        live_success_failure_events.pop(num, None)
+                        live_success_failure_results.pop(num, None)
+                except Exception:
+                    logger.exception("Failed to forward to target chat %s", target_chat)
+                    await num_msg.edit_text(f"{num} ❌ Error forwarding to target chat ID.")
+            else:
+                await num_msg.edit_text(f"{num} ⚠️ Target chat ID not set! Use /setchatid.")
 
         await status_msg.edit_text(f"Batch completed.\nProcessed: {total_numbers_count}/{total_numbers_count}")
 
@@ -1329,3 +1330,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
