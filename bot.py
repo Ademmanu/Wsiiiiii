@@ -2,7 +2,8 @@ import asyncio
 import logging
 import os
 import re
-from typing import Optional
+import json
+from typing import Optional, List, Dict, Any, Tuple
 
 import aiohttp
 import asyncpg
@@ -15,9 +16,9 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 
-# ----------------------------
+# ------------------------------------------------------------
 # Config
-# ----------------------------
+# ------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -32,20 +33,18 @@ MACRODROID_WEBHOOK_URL = os.getenv(
     "http://trigger.macrodroid.com/YOUR_UNIQUE_DEVICE_UUID/telegram_bot",
 )
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/dbname")
-PORT = int(os.getenv("PORT", 10000))
+PORT = int(os.getenv("PORT", "10000"))
 
 router = Router()
 
-# ----------------------------
+# ------------------------------------------------------------
 # DB / state
-# ----------------------------
+# ------------------------------------------------------------
 db_pool: Optional[asyncpg.Pool] = None
 
-# old global for compatibility
 target_chat_id: Optional[int] = None
 user_target_chat_ids: dict[int, int] = {}
 
-# processing state
 is_processing = False
 is_paused = False
 current_task: Optional[asyncio.Task] = None
@@ -61,22 +60,17 @@ skip_current_number = False
 pause_event = asyncio.Event()
 pause_event.set()
 
-# OTP group selection
 selected_otp_group: dict[int, dict] = {}
 
-# live SUCCESS/FAILED decision tracking
 live_success_failure_events: dict[str, asyncio.Event] = {}
 live_success_failure_results: dict[str, str] = {}
 
-# user Telethon client
 user_clients: dict[int, TelegramClient] = {}
-
-# login flow
 login_states: dict[int, dict] = {}
 
-# ----------------------------
+# ------------------------------------------------------------
 # DB helpers
-# ----------------------------
+# ------------------------------------------------------------
 async def init_db():
     global db_pool
     dsn = DATABASE_URL.replace("postgres://", "postgresql://", 1) if DATABASE_URL.startswith("postgres://") else DATABASE_URL
@@ -86,7 +80,8 @@ async def init_db():
         logger.info("Connected to PostgreSQL")
 
         async with db_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS number_logs (
                     id SERIAL PRIMARY KEY,
                     phone_number VARCHAR(32) NOT NULL,
@@ -99,7 +94,9 @@ async def init_db():
                     id SERIAL PRIMARY KEY,
                     user_id BIGINT NOT NULL,
                     name VARCHAR(255) NOT NULL,
-                    group_ids TEXT NOT NULL
+                    group_ids TEXT NOT NULL,
+                    formats TEXT DEFAULT '[]',
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
 
                 CREATE TABLE IF NOT EXISTS bot_settings (
@@ -112,9 +109,19 @@ async def init_db():
                     session_str TEXT NOT NULL,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
-            """)
-    except Exception as e:
-        logger.exception("Failed to initialize PostgreSQL: %s", e)
+                """
+            )
+
+            # Prevent duplicate names per user
+            await conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_otp_groups_bot_user_name
+                ON otp_groups_bot (user_id, name)
+                """
+            )
+    except Exception:
+        logger.exception("Failed to initialize PostgreSQL")
+
 
 async def log_number_status(phone_number: str, status: str, details: str = None):
     if not db_pool:
@@ -127,12 +134,13 @@ async def log_number_status(phone_number: str, status: str, details: str = None)
                 status,
                 details,
             )
-    except Exception as e:
-        logger.exception("Failed to write log for %s: %s", phone_number, e)
+    except Exception:
+        logger.exception("Failed to write log for %s", phone_number)
 
-# ----------------------------
+
+# ------------------------------------------------------------
 # Phone helpers
-# ----------------------------
+# ------------------------------------------------------------
 def parse_phone_number(raw_number: str):
     cleaned = raw_number.strip()
     if not cleaned.startswith("+"):
@@ -145,7 +153,6 @@ def parse_phone_number(raw_number: str):
     except Exception:
         pass
 
-    # fallback common patterns
     if cleaned.startswith("+234") or cleaned.startswith("+233"):
         return cleaned[1:4], cleaned[4:]
     elif cleaned.startswith("+44"):
@@ -153,6 +160,7 @@ def parse_phone_number(raw_number: str):
     elif len(cleaned) > 3:
         return cleaned[1:4], cleaned[4:]
     return "", cleaned[1:]
+
 
 async def call_device_api(raw_number: str, payload_type: str = "check", code: str | None = None):
     country_code, national_number = parse_phone_number(raw_number)
@@ -170,13 +178,14 @@ async def call_device_api(raw_number: str, payload_type: str = "check", code: st
             async with session.get(url, timeout=10) as response:
                 logger.info("Webhook response status: %s", response.status)
                 return True
-    except Exception as e:
-        logger.exception("Failed to reach MacroDroid webhook: %s", e)
+    except Exception:
+        logger.exception("Failed to reach MacroDroid webhook")
         return False
 
-# ----------------------------
-# Telethon login/logout & session storage
-# ----------------------------
+
+# ------------------------------------------------------------
+# Telethon login/logout and session persistence
+# ------------------------------------------------------------
 async def _save_session_to_db(user_id: int, session_str: str):
     if not db_pool:
         return
@@ -192,11 +201,13 @@ async def _save_session_to_db(user_id: int, session_str: str):
             session_str,
         )
 
+
 async def _remove_saved_session_from_db(user_id: int):
     if not db_pool:
         return
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM user_sessions WHERE user_id = $1", user_id)
+
 
 async def _load_saved_sessions_on_startup():
     if not db_pool:
@@ -217,6 +228,7 @@ async def _load_saved_sessions_on_startup():
         except Exception:
             logger.exception("Could not restore Telethon session for user %s", uid)
 
+
 async def _disconnect_user_client(user_id: int):
     client = user_clients.pop(user_id, None)
     if client:
@@ -225,20 +237,6 @@ async def _disconnect_user_client(user_id: int):
         except Exception:
             logger.exception("Error disconnecting client for user %s", user_id)
 
-async def _build_user_client_from_session(user_id: int, session_str: str) -> bool:
-    try:
-        client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-        await client.connect()
-
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            return False
-
-        user_clients[user_id] = client
-        return True
-    except Exception:
-        logger.exception("Failed to build client for user %s", user_id)
-        return False
 
 async def _get_user_target_chat(user_id: int) -> Optional[int]:
     if user_id in user_target_chat_ids:
@@ -255,15 +253,104 @@ async def _get_user_target_chat(user_id: int) -> Optional[int]:
 
     return target_chat_id
 
-# ----------------------------
-# OTP fetching from chosen groups
-# ----------------------------
-async def fetch_otp_from_groups(user_id: int, group_ids: list[str], lookback: int = 30) -> Optional[str]:
+
+# ------------------------------------------------------------
+# OTP parsing and search logic (FORDET-style)
+# ------------------------------------------------------------
+class OTPFormatParser:
+    @staticmethod
+    def extract_number(text: str) -> str:
+        match = re.search(r"\b\d{4,8}\b", text)
+        if match:
+            return match.group(0)
+        return ""
+
+    @staticmethod
+    def parse_format(format_str: str) -> Dict[str, Any]:
+        format_str = (format_str or "").strip()
+        if not format_str:
+            return {"type": "plain", "value": ""}
+        tokens = []
+        for part in re.split(r"(\d+|[A-Za-z]+|[^A-Za-z0-9]+)", format_str):
+            if part:
+                tokens.append(part)
+        return {"type": "format", "tokens": tokens, "value": format_str}
+
+    @staticmethod
+    def apply_format(number: str, format_dict: Dict[str, Any]) -> str:
+        if not format_dict:
+            return number
+        if format_dict.get("type") == "plain":
+            return number
+        tokens = format_dict.get("tokens", [])
+        if not tokens:
+            return number
+        idx = 0
+        out = []
+        for part in tokens:
+            if part.isdigit():
+                if idx < len(number):
+                    out.append(number[idx:idx + len(part)])
+                    idx += len(part)
+                else:
+                    out.append(part)
+            else:
+                out.append(part)
+        return "".join(out)
+
+    @staticmethod
+    def extract_otp(text: str) -> Optional[str]:
+        text = (text or "").strip()
+        if not text:
+            return None
+        match = re.search(r"\b\d{4,8}\b", text)
+        if match:
+            return match.group(0)
+        return None
+
+    @staticmethod
+    def message_contains_format(message_text: str, format_str: str) -> bool:
+        if not message_text or not format_str:
+            return False
+        return format_str in message_text or re.search(r"\d{4,8}", message_text) is not None
+
+
+class AutoOTPSearchManager:
+    def __init__(self):
+        self.active_searches: Dict[str, Dict[str, Any]] = {}
+
+    async def start_search(self, user_id: int, duplicate_key: str, group_ids: List[str], client: TelegramClient):
+        if not group_ids:
+            return None
+        self.active_searches[duplicate_key] = {
+            "user_id": user_id,
+            "group_ids": group_ids,
+            "client": client,
+            "started_at": asyncio.get_running_loop().time(),
+        }
+        return duplicate_key
+
+    async def cancel_search(self, duplicate_key: str):
+        self.active_searches.pop(duplicate_key, None)
+
+    async def check_message(self, user_id: int, group_id: int, message: Any) -> bool:
+        txt = (getattr(message, "message", "") or "").strip()
+        if not txt:
+            return False
+        code = OTPFormatParser.extract_otp(txt)
+        return bool(code)
+
+
+otp_search_manager = AutoOTPSearchManager()
+
+
+async def fetch_otp_from_groups(user_id: int, group_ids: List[str], lookback: int = 30, formats: Optional[List[str]] = None) -> Optional[str]:
     client = user_clients.get(user_id)
     if not client:
         return None
 
-    otp_re = re.compile(r"\b(\d{4,6})\b")
+    formats = formats or []
+    otp_re = re.compile(r"\b(\d{4,8})\b")
 
     for gid in group_ids:
         if not gid:
@@ -279,6 +366,13 @@ async def fetch_otp_from_groups(user_id: int, group_ids: list[str], lookback: in
                 txt = (msg.message or "").strip()
                 if not txt:
                     continue
+                # prefer explicit format if provided
+                if formats:
+                    for fmt in formats:
+                        if OTPFormatParser.message_contains_format(txt, fmt):
+                            cand = OTPFormatParser.extract_otp(txt)
+                            if cand:
+                                return cand
                 m = otp_re.search(txt)
                 if m:
                     return m.group(1)
@@ -289,9 +383,73 @@ async def fetch_otp_from_groups(user_id: int, group_ids: list[str], lookback: in
 
     return None
 
-# ----------------------------
+
+# ------------------------------------------------------------
+# FORDET-style category listing for getallid
+# ------------------------------------------------------------
+_GETALLID_PAGE_SIZE = 10
+
+
+async def _dialogs_to_entries(client: TelegramClient, category: str) -> list:
+    entries = []
+    async for dlg in client.iter_dialogs(limit=500):
+        chat = dlg.entity
+        cid = getattr(chat, "id", None)
+        type_name = type(chat).__name__.lower()
+        title = (
+            getattr(chat, "title", None)
+            or getattr(chat, "first_name", None)
+            or getattr(chat, "username", None)
+            or "(no title)"
+        )
+
+        is_user = type_name == "user"
+        is_channel = type_name == "channel"
+        is_chat = type_name == "chat"
+        is_bot = bool(getattr(chat, "bot", False))
+
+        include = False
+        if category == "All":
+            include = True
+        elif category == "Groups":
+            include = is_chat or (is_channel and getattr(chat, "megagroup", False))
+        elif category == "Channels":
+            include = is_channel and not getattr(chat, "megagroup", False)
+        elif category == "Private":
+            include = is_user and not is_bot
+        elif category == "Bots":
+            include = is_user and is_bot
+
+        if include and cid is not None:
+            entries.append((str(title), int(cid), type_name))
+
+    return entries
+
+
+def _make_getallid_kb(entries_page: list, category: str, page: int, total_pages: int):
+    kb = []
+    for title, cid, type_name in entries_page:
+        label = (title[:30] + "...") if len(title) > 33 else title
+        kb.append([
+            InlineKeyboardButton(f"Select: {label}", callback_data=f"getallid:select:{cid}"),
+            InlineKeyboardButton("Info", callback_data=f"getallid:info:{cid}"),
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"getallid:cat:{category}:{page - 1}"))
+    nav.append(InlineKeyboardButton("🔙 Categories", callback_data="getallid:back"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"getallid:cat:{category}:{page + 1}"))
+    if nav:
+        kb.append(nav)
+
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+# ------------------------------------------------------------
 # Commands: start/login/logout/setchatid/getallid/otpgroups
-# ----------------------------
+# ------------------------------------------------------------
 @router.message(Command("start"))
 async def start_handler(message: Message):
     help_text = (
@@ -312,19 +470,22 @@ async def start_handler(message: Message):
     )
     await message.answer(help_text)
 
+
 @router.message(Command("login"))
 async def login_command(message: Message):
     user_id = message.from_user.id
     login_states[user_id] = {"stage": "phone"}
     await message.answer("Please send your phone number with country code, e.g. +2348012345678")
 
+
 @router.message(Command("logout"))
 async def logout_command(message: Message):
     user_id = message.from_user.id
-    _disconnect_user_client(user_id)
+    await _disconnect_user_client(user_id)
     await _remove_saved_session_from_db(user_id)
     login_states.pop(user_id, None)
     await message.answer("✅ Logged out and session removed.")
+
 
 @router.message(Command("setchatid"))
 async def setchatid_handler(message: Message):
@@ -354,34 +515,22 @@ async def setchatid_handler(message: Message):
     except ValueError:
         await message.answer("❌ Invalid Chat ID format. Must be an integer.")
 
+
 @router.message(Command("getallid"))
 async def getallid_command(message: Message):
-    user_id = message.from_user.id
-    client = user_clients.get(user_id)
+    kb = [
+        [InlineKeyboardButton("All", callback_data="getallid:cat:All:0")],
+        [
+            InlineKeyboardButton("Groups", callback_data="getallid:cat:Groups:0"),
+            InlineKeyboardButton("Channels", callback_data="getallid:cat:Channels:0"),
+        ],
+        [
+            InlineKeyboardButton("Private", callback_data="getallid:cat:Private:0"),
+            InlineKeyboardButton("Bots", callback_data="getallid:cat:Bots:0"),
+        ],
+    ]
+    await message.answer("Select category to list chat ids:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-    if client:
-        try:
-            text_lines = ["📋 Recent chats accessible by your logged-in user:\n"]
-            async for dlg in client.iter_dialogs(limit=50):
-                chat = dlg.entity
-                cid = getattr(chat, "id", None)
-                title = getattr(chat, "title", None) or getattr(chat, "first_name", None) or getattr(chat, "username", None) or ""
-                ctype = type(chat).__name__
-                text_lines.append(f"• {title} — id: `{cid}` — type: `{ctype}`")
-            await message.answer("\n".join(text_lines), parse_mode="Markdown")
-            return
-        except Exception:
-            logger.exception("Failed to list dialogs for user %s", user_id)
-            await message.answer("Failed to list dialogs using your logged-in user. Make sure the session is valid and active.")
-            return
-
-    await message.answer(
-        f"📍 **Current Chat Info:**\n"
-        f"• Chat ID: `{message.chat.id}`\n"
-        f"• Type: `{message.chat.type}`\n"
-        f"• Title: `{message.chat.title or message.chat.full_name}`",
-        parse_mode="Markdown",
-    )
 
 @router.message(Command("otpgroups"))
 async def otpgroups_command(message: Message):
@@ -395,12 +544,11 @@ async def otpgroups_command(message: Message):
             gids = gids.strip()
             if not name or not gids:
                 raise ValueError
-
             async with db_pool.acquire() as conn:
                 await conn.execute(
                     """
-                    INSERT INTO otp_groups_bot (user_id, name, group_ids)
-                    VALUES ($1, $2, $3)
+                    INSERT INTO otp_groups_bot (user_id, name, group_ids, formats)
+                    VALUES ($1, $2, $3, '[]')
                     ON CONFLICT (user_id, name)
                     DO UPDATE SET group_ids = EXCLUDED.group_ids
                     """,
@@ -408,34 +556,66 @@ async def otpgroups_command(message: Message):
                     name,
                     gids,
                 )
-            await message.answer(f"✅ OTP Group `{name}` added successfully.")
+            await message.answer(f"✅ OTP Group `{name}` added successfully.", parse_mode="Markdown")
         except Exception:
             await message.answer("❌ Format error. Use: `/otpgroups GroupName: -100123,-100456`", parse_mode="Markdown")
             return
 
+    if db_pool is None:
+        await message.answer("Database not ready.")
+        return
+
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT name, group_ids FROM otp_groups_bot WHERE user_id = $1 ORDER BY name ASC", user_id)
+        rows = await conn.fetch(
+            "SELECT id, name, group_ids FROM otp_groups_bot WHERE user_id = $1 ORDER BY name ASC",
+            user_id,
+        )
 
     if not rows:
         await message.answer("No OTP groups configured. Add one using:\n`/otpgroups GroupName: -100123,-100456`", parse_mode="Markdown")
         return
 
+    page_size = 5
+    page = 0
+    total_pages = (len(rows) + page_size - 1) // page_size
+
+    def render(page_index: int):
+        start = page_index * page_size
+        end = start + page_size
+        subset = rows[start:end]
+        kb = []
+        for row in subset:
+            name = row["name"]
+            gids = row["group_ids"]
+            kb.append([
+                InlineKeyboardButton(f"Select {name}", callback_data=f"otp:select:{name}"),
+                InlineKeyboardButton(f"Edit {name}", callback_data=f"otp:edit:{name}"),
+            ])
+            kb.append([
+                InlineKeyboardButton(f"Rename {name}", callback_data=f"otp:rename:{name}"),
+                InlineKeyboardButton(f"Delete {name}", callback_data=f"otp:delete:{name}"),
+            ])
+        nav = []
+        if page_index > 0:
+            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"otp:page:{page_index - 1}"))
+        nav.append(InlineKeyboardButton("➕ Add New", callback_data="otp:add"))
+        if page_index < total_pages - 1:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"otp:page:{page_index + 1}"))
+        if nav:
+            kb.append(nav)
+        kb.append([InlineKeyboardButton("🗑 Delete All", callback_data="otp:delete_all")])
+        return InlineKeyboardMarkup(inline_keyboard=kb)
+
     text = "📋 **Configured OTP Groups:**\n\n"
-    kb = []
-    for row in rows:
-        text += f"• **{row['name']}**: `{row['group_ids']}`\n"
-        kb.append([
-            InlineKeyboardButton(text=f"Select {row['name']}", callback_data=f"otp_select:{row['name']}"),
-            InlineKeyboardButton(text=f"Delete {row['name']}", callback_data=f"otp_delete:{row['name']}"),
-        ])
+    for row in rows[start:end if False else 0:1]:
+        pass
+    text += "\n".join([f"• **{r['name']}**: `{r['group_ids']}`" for r in rows[:page_size]])
+    await message.answer(text, parse_mode="Markdown", reply_markup=render(page))
 
-    # single menu row for Add Group
-    kb.append([InlineKeyboardButton(text="Add Group", callback_data="otp_add")])
-    await message.answer(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-# ----------------------------
+# ------------------------------------------------------------
 # Real login flow (phone -> code -> password)
-# ----------------------------
+# ------------------------------------------------------------
 @router.message()
 async def login_flow_messages(message: Message):
     user_id = message.from_user.id
@@ -474,7 +654,6 @@ async def login_flow_messages(message: Message):
             state.update({"stage": "code", "phone": phone, "temp_client": temp_client})
             await message.answer("Code sent to your Telegram. Please reply with the code you received.")
             return
-
         except Exception:
             logger.exception("Error starting login flow")
             await message.answer("❌ Internal error starting login.")
@@ -499,7 +678,6 @@ async def login_flow_messages(message: Message):
                 await message.answer("Two-step verification enabled. Please send your password.")
                 return
             except Exception:
-                # fallback for some versions
                 try:
                     await temp_client.sign_in(phone=phone, code=code)
                 except Exception:
@@ -518,7 +696,6 @@ async def login_flow_messages(message: Message):
             login_states.pop(user_id, None)
             await message.answer("✅ Login successful and session saved.")
             return
-
         except Exception:
             logger.exception("Error during code sign-in")
             await message.answer("❌ Login failed. Please try /login again.")
@@ -555,34 +732,75 @@ async def login_flow_messages(message: Message):
             login_states.pop(user_id, None)
             return
 
-# ----------------------------
-# OTP GROUP inline button handlers
-# ----------------------------
-@router.callback_query(F.data == "otp_add")
+
+# ------------------------------------------------------------
+# OTP group inline buttons / FORDET-style handlers
+# ------------------------------------------------------------
+@router.callback_query(F.data == "otp:add")
 async def otp_add_callback(callback: CallbackQuery):
     await callback.message.edit_text(
-        "Add OTP Group:\nUse `/otpgroups GroupName: -100123,-100456`",
+        "Add OTP Group:\nUse `/otpgroups Name: -100123,-100456`",
         parse_mode="Markdown",
     )
 
-@router.callback_query(F.data.startswith("otp_delete:"))
-async def otp_delete_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    group_name = callback.data.replace("otp_delete:", "", 1)
 
+@router.callback_query(F.data.startswith("otp:page:"))
+async def otp_page_callback(callback: CallbackQuery):
+    page_text = callback.data.replace("otp:page:", "", 1)
+    try:
+        page = int(page_text)
+    except ValueError:
+        page = 0
+
+    user_id = callback.from_user.id
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM otp_groups_bot WHERE user_id = $1 AND name = $2",
+        rows = await conn.fetch(
+            "SELECT id, name, group_ids FROM otp_groups_bot WHERE user_id = $1 ORDER BY name ASC",
             user_id,
-            group_name,
         )
 
-    await callback.message.edit_text(f"✅ Deleted OTP group: **{group_name}**", parse_mode="Markdown")
+    if not rows:
+        await callback.message.edit_text("No OTP groups configured. Use `/otpgroups GroupName: -100123,-100456`", parse_mode="Markdown")
+        return
 
-@router.callback_query(F.data.startswith("otp_select:"))
+    page_size = 5
+    total_pages = (len(rows) + page_size - 1) // page_size
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    end = start + page_size
+    subset = rows[start:end]
+
+    kb = []
+    for row in subset:
+        name = row["name"]
+        kb.append([
+            InlineKeyboardButton(f"Select {name}", callback_data=f"otp:select:{name}"),
+            InlineKeyboardButton(f"Edit {name}", callback_data=f"otp:edit:{name}"),
+        ])
+        kb.append([
+            InlineKeyboardButton(f"Rename {name}", callback_data=f"otp:rename:{name}"),
+            InlineKeyboardButton(f"Delete {name}", callback_data=f"otp:delete:{name}"),
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"otp:page:{page - 1}"))
+    nav.append(InlineKeyboardButton("➕ Add New", callback_data="otp:add"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"otp:page:{page + 1}"))
+    if nav:
+        kb.append(nav)
+    kb.append([InlineKeyboardButton("🗑 Delete All", callback_data="otp:delete_all")])
+
+    text = "📋 **Configured OTP Groups:**\n\n"
+    text += "\n".join([f"• **{r['name']}**: `{r['group_ids']}`" for r in subset])
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+
+@router.callback_query(F.data.startswith("otp:select:"))
 async def otp_select_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
-    group_name = callback.data.replace("otp_select:", "", 1)
+    group_name = callback.data.replace("otp:select:", "", 1)
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -601,16 +819,194 @@ async def otp_select_callback(callback: CallbackQuery):
     else:
         await callback.answer("Group not found.", show_alert=True)
 
-# ----------------------------
-# Monitor chat for exact SUCCESS/FAILED
-# ----------------------------
+
+@router.callback_query(F.data.startswith("otp:edit:"))
+async def otp_edit_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    name = callback.data.replace("otp:edit:", "", 1)
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT name, group_ids FROM otp_groups_bot WHERE user_id = $1 AND name = $2",
+            user_id,
+            name,
+        )
+    if not row:
+        await callback.answer("Group not found.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"Edit OTP Group\n\n**{name}**\n`{row['group_ids']}`\n\nUse `/otpgroups {name}: -100123,-100456` to update it.",
+        parse_mode="Markdown",
+    )
+
+
+@router.callback_query(F.data.startswith("otp:rename:"))
+async def otp_rename_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    name = callback.data.replace("otp:rename:", "", 1)
+    await callback.message.edit_text(
+        f"Rename OTP Group\nCurrent name: **{name}**\n\nUse: `/otpgroups NewName: -100123,-100456`",
+        parse_mode="Markdown",
+    )
+
+
+@router.callback_query(F.data.startswith("otp:delete:"))
+async def otp_delete_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    name = callback.data.replace("otp:delete:", "", 1)
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM otp_groups_bot WHERE user_id = $1 AND name = $2",
+            user_id,
+            name,
+        )
+    await callback.message.edit_text(f"✅ Deleted OTP group: **{name}**", parse_mode="Markdown")
+
+
+@router.callback_query(F.data == "otp:delete_all")
+async def otp_delete_all_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM otp_groups_bot WHERE user_id = $1", user_id)
+    await callback.message.edit_text("✅ Deleted all OTP groups.", parse_mode="Markdown")
+
+
+# ------------------------------------------------------------
+# getallid category handlers
+# ------------------------------------------------------------
+@router.callback_query(F.data == "getallid:back")
+async def getallid_back_callback(callback: CallbackQuery):
+    kb = [
+        [InlineKeyboardButton("All", callback_data="getallid:cat:All:0")],
+        [
+            InlineKeyboardButton("Groups", callback_data="getallid:cat:Groups:0"),
+            InlineKeyboardButton("Channels", callback_data="getallid:cat:Channels:0"),
+        ],
+        [
+            InlineKeyboardButton("Private", callback_data="getallid:cat:Private:0"),
+            InlineKeyboardButton("Bots", callback_data="getallid:cat:Bots:0"),
+        ],
+    ]
+    await callback.message.edit_text("Select category to list chat ids:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+
+@router.callback_query(F.data.startswith("getallid:cat:"))
+async def getallid_category_callback(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    if len(parts) < 4:
+        await callback.answer("Invalid request", show_alert=True)
+        return
+    category = parts[2]
+    try:
+        page = int(parts[3])
+    except ValueError:
+        page = 0
+
+    user_id = callback.from_user.id
+    client = user_clients.get(user_id)
+    if not client:
+        await callback.message.edit_text(
+            "No logged-in user session found. Please /login to list your dialogs, or use the current chat info below."
+        )
+        await callback.message.reply(
+            f"📍 **Current Chat Info:**\n• Chat ID: `{callback.message.chat.id}`\n• Type: `{callback.message.chat.type}`\n• Title: `{callback.message.chat.title or callback.message.chat.full_name}`",
+            parse_mode="Markdown",
+        )
+        return
+
+    await callback.message.edit_text(f"Loading {category} dialogs...")
+    try:
+        entries = await _dialogs_to_entries(client, category)
+    except Exception:
+        logger.exception("Failed to fetch dialogs for getallid")
+        await callback.message.edit_text("Failed to fetch dialogs. Make sure your session is active and you have granted access.")
+        return
+
+    if not entries:
+        await callback.message.edit_text(f"No dialogs found for category: {category}")
+        return
+
+    total = len(entries)
+    total_pages = (total + _GETALLID_PAGE_SIZE - 1) // _GETALLID_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+    start = page * _GETALLID_PAGE_SIZE
+    end = start + _GETALLID_PAGE_SIZE
+    entries_page = entries[start:end]
+
+    text_lines = [f"Category: {category} — showing {start + 1}-{min(end, total)} of {total}\n"]
+    for title, cid, type_name in entries_page:
+        text_lines.append(f"• {title} — id: `{cid}` — type: `{type_name}`")
+    kb = _make_getallid_kb(entries_page, category, page, total_pages)
+    await callback.message.edit_text("\n".join(text_lines), parse_mode="Markdown", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("getallid:select:"))
+async def getallid_select_callback(callback: CallbackQuery):
+    cid_s = callback.data.replace("getallid:select:", "", 1)
+    try:
+        cid = int(cid_s)
+    except ValueError:
+        await callback.answer("Invalid chat id", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    user_target_chat_ids[user_id] = cid
+    global target_chat_id
+    target_chat_id = cid
+
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO bot_settings (user_id, chat_id)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id)
+                DO UPDATE SET chat_id = EXCLUDED.chat_id
+                """,
+                user_id,
+                cid,
+            )
+
+    await callback.message.edit_text(f"✅ Target chat set to `{cid}`", parse_mode="Markdown")
+    await callback.answer("Target chat saved.", show_alert=False)
+
+
+@router.callback_query(F.data.startswith("getallid:info:"))
+async def getallid_info_callback(callback: CallbackQuery):
+    cid_s = callback.data.replace("getallid:info:", "", 1)
+    try:
+        cid = int(cid_s)
+    except ValueError:
+        await callback.answer("Invalid chat id", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    client = user_clients.get(user_id)
+    info_text = f"Chat ID: `{cid}`\n"
+    if client:
+        try:
+            entity = await client.get_entity(cid)
+            title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or getattr(entity, "username", None) or ""
+            info_text += f"Title: {title}\nType: {type(entity).__name__}\n"
+        except Exception:
+            info_text += "Could not fetch more details (maybe you don't have access).\n"
+
+    kb_back = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton("🔙 Back", callback_data="getallid:back")]]
+    )
+    await callback.message.edit_text(info_text, parse_mode="Markdown", reply_markup=kb_back)
+    await callback.answer()
+
+
+# ------------------------------------------------------------
+# Monitor chat for exact SUCCESS/FAILED messages
+# ------------------------------------------------------------
 @router.message()
 async def monitor_live_chat_messages(message: Message):
     text = message.text or ""
     if not text:
         return
 
-    # exact case-sensitive check
     if "SUCCESS" in text or "FAILED" in text:
         for num, ev in list(live_success_failure_events.items()):
             if num in text:
@@ -620,9 +1016,10 @@ async def monitor_live_chat_messages(message: Message):
                     live_success_failure_results[num] = "FAILED"
                 ev.set()
 
-# ----------------------------
+
+# ------------------------------------------------------------
 # Number processing flow
-# ----------------------------
+# ------------------------------------------------------------
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_numbers(message: Message):
     global is_processing, current_task, device_status, skip_current_number, current_index, total_numbers_count, active_number
@@ -632,11 +1029,8 @@ async def handle_numbers(message: Message):
         return
 
     user_id = message.from_user.id
-
-    # load configured target chat for this user
     target_chat = await _get_user_target_chat(user_id)
     if target_chat is None:
-        # if target chat not set on this user, fallback to global value
         target_chat = target_chat_id
 
     text = message.text
@@ -646,17 +1040,16 @@ async def handle_numbers(message: Message):
         return
 
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT name FROM otp_groups_bot WHERE user_id = $1", user_id)
+        rows = await conn.fetch("SELECT name, group_ids FROM otp_groups_bot WHERE user_id = $1 ORDER BY name ASC", user_id)
 
     if not rows:
         await message.answer("❌ No OTP groups found! Please configure one using `/otpgroups GroupName: -100123,-100456`.", parse_mode="Markdown")
         return
 
-    # ask user to pick an otp group
     keyboard_buttons = []
     for row in rows:
         keyboard_buttons.append([
-            InlineKeyboardButton(text=row["name"], callback_data=f"otp_select:{row['name']}"),
+            InlineKeyboardButton(text=row["name"], callback_data=f"otp:select:{row['name']}"),
         ])
 
     markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
@@ -670,8 +1063,8 @@ async def handle_numbers(message: Message):
         return
 
     is_processing = True
-    total_numbers_count = len(numbers)
-    current_task = asyncio.current_task()
+total_numbers_count = len(numbers)
+current_task = asyncio.current_task()
 
     try:
         status_msg = await message.answer(f"Processing {total_numbers_count} numbers...")
@@ -681,7 +1074,6 @@ async def handle_numbers(message: Message):
             skip_current_number = False
 
             await pause_event.wait()
-
             await status_msg.edit_text(f"Processing batch\n\nProgress: {i}/{total_numbers_count}\nTarget: {num}")
             num_msg = await message.answer(f"{num} ⏳ Checking on device...")
 
@@ -695,13 +1087,12 @@ async def handle_numbers(message: Message):
                 continue
 
             try:
-                await asyncio.wait_for(device_event.wait(), timeout=300)  # 5 minutes
+                await asyncio.wait_for(device_event.wait(), timeout=300)
             except asyncio.TimeoutError:
                 if skip_current_number:
                     await num_msg.edit_text(f"{num} ⏭️ Skipped")
                     await log_number_status(num, "skipped")
                     continue
-
                 await num_msg.edit_text(f"{num} 🟠 Ended (Device timeout - 5 mins)")
                 await log_number_status(num, "device_timeout")
                 continue
@@ -713,7 +1104,6 @@ async def handle_numbers(message: Message):
 
             result_text = (device_status or "").lower()
 
-            # simple statuses
             if "blocked" in result_text:
                 await num_msg.edit_text(f"{num} ⚫ Bad")
                 await log_number_status(num, "blocked")
@@ -730,30 +1120,26 @@ async def handle_numbers(message: Message):
                 await log_number_status(num, "error")
                 continue
 
-            # if the device requested code: fetch OTP from selected groups
             if "request_code" in result_text or "requestcode" in result_text or "request-code" in result_text:
                 selected_group = selected_otp_group.get(user_id, {})
                 await num_msg.edit_text(
                     f"{num} ⚪ Device requested code. Using group: {selected_group.get('name', 'Default')}"
                 )
 
-                group_ids_raw = selected_group.get("group_ids", "")
+                group_ids_raw = (selected_group.get("group_ids") or "")
                 group_ids = [g.strip() for g in group_ids_raw.split(",") if g.strip()]
-
                 code = None
-                client = user_clients.get(user_id)
 
-                if client and group_ids:
+                if group_ids:
                     code = await fetch_otp_from_groups(user_id, group_ids)
                     if code:
                         await num_msg.edit_text(f"{num} ⚪ OTP fetched from group: `{code}`", parse_mode="Markdown")
                     else:
-                        await num_msg.edit_text(f"{num} ⚠️ Could not find OTP in the chosen group. Please ensure your logged-in account is a member and can read the group.")
+                        await num_msg.edit_text(
+                            f"{num} ⚠️ Could not find OTP in the chosen group. Please ensure your logged-in account is a member and can read the group."
+                        )
                 else:
-                    if not client:
-                        await num_msg.edit_text(f"{num} ⚠️ No logged-in user session. Use /login first.")
-                    else:
-                        await num_msg.edit_text(f"{num} ⚠️ No group IDs configured for the selected OTP group.")
+                    await num_msg.edit_text(f"{num} ⚠️ No group IDs configured for the selected OTP group.")
 
                 if not code:
                     await num_msg.edit_text(f"{num} 🔴 No OTP available. Skipping.")
@@ -765,7 +1151,7 @@ async def handle_numbers(message: Message):
                 await call_device_api(num, payload_type="send_code", code=code)
 
                 try:
-                    await asyncio.wait_for(device_event.wait(), timeout=300)  # 5 minutes
+                    await asyncio.wait_for(device_event.wait(), timeout=300)
                     if skip_current_number:
                         await num_msg.edit_text(f"{num} ⏭️ Skipped")
                         await log_number_status(num, "skipped")
@@ -775,19 +1161,16 @@ async def handle_numbers(message: Message):
                         await num_msg.edit_text(f"{num} ⏭️ Skipped")
                         await log_number_status(num, "skipped")
                         continue
-
                     await num_msg.edit_text(f"{num} 🟠 Ended (Device timeout after sending code - 5 mins)")
                     await log_number_status(num, "device_timeout_after_code")
                     continue
 
-            # device must signal "continue"
             result_after = (device_status or "").lower()
             if "continue" not in result_after and "continued" not in result_after and "proceed" not in result_after:
                 await num_msg.edit_text(f"{num} ⚠️ Device did not signal to continue. Status: `{device_status}`", parse_mode="Markdown")
                 await log_number_status(num, "no_continue")
                 continue
 
-            # now forward the plain number to target chat and monitor for SUCCESS/FAILED
             await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting SUCCESS/FAILED...")
 
             if target_chat:
@@ -797,7 +1180,7 @@ async def handle_numbers(message: Message):
                     live_success_failure_events[num] = ev
 
                     try:
-                        await asyncio.wait_for(ev.wait(), timeout=300)  # 5 min
+                        await asyncio.wait_for(ev.wait(), timeout=300)
                         decision = live_success_failure_results.get(num, "UNKNOWN")
                         await num_msg.edit_text(f"{num} 🏁 Result Decided: {decision}")
                         await log_number_status(num, decision.lower())
@@ -807,9 +1190,8 @@ async def handle_numbers(message: Message):
                     finally:
                         live_success_failure_events.pop(num, None)
                         live_success_failure_results.pop(num, None)
-
-                except Exception as e:
-                    logger.exception("Failed to forward to target chat %s: %s", target_chat, e)
+                except Exception:
+                    logger.exception("Failed to forward to target chat %s", target_chat)
                     await num_msg.edit_text(f"{num} ❌ Error forwarding to target chat ID.")
             else:
                 await num_msg.edit_text(f"{num} ⚠️ Target chat ID not set! Use /setchatid.")
@@ -818,9 +1200,9 @@ async def handle_numbers(message: Message):
 
     except asyncio.CancelledError:
         logger.info("Task cancelled by user request.")
-    except Exception as e:
+    except Exception:
         logger.exception("Error during processing")
-        await message.answer(f"An error occurred during processing: {str(e)}")
+        await message.answer("An error occurred during processing.")
     finally:
         is_processing = False
         is_paused = False
@@ -829,9 +1211,10 @@ async def handle_numbers(message: Message):
         skip_current_number = False
         pause_event.set()
 
-# ----------------------------
+
+# ------------------------------------------------------------
 # pause/resume/cancel/stats
-# ----------------------------
+# ------------------------------------------------------------
 @router.message(Command("cancel"))
 async def cancel_handler(message: Message):
     global is_processing, current_task, skip_current_number
@@ -845,6 +1228,7 @@ async def cancel_handler(message: Message):
     else:
         await message.answer("No active processing session to cancel.")
 
+
 @router.message(Command("pause"))
 async def pause_handler(message: Message):
     global is_paused
@@ -854,6 +1238,7 @@ async def pause_handler(message: Message):
         await message.answer("Processing paused.")
     else:
         await message.answer("No active processing session to pause.")
+
 
 @router.message(Command("resume"))
 async def resume_handler(message: Message):
@@ -865,6 +1250,7 @@ async def resume_handler(message: Message):
     else:
         await message.answer("Processing is not currently paused.")
 
+
 @router.message(Command("next"))
 async def next_handler(message: Message):
     global skip_current_number
@@ -875,6 +1261,7 @@ async def next_handler(message: Message):
     else:
         await message.answer("No active processing session.")
 
+
 @router.message(Command("stats"))
 async def stats_handler(message: Message):
     if is_processing:
@@ -882,11 +1269,13 @@ async def stats_handler(message: Message):
     else:
         await message.answer("No active session running.")
 
-# ----------------------------
-# Web server for device callback
-# ----------------------------
+
+# ------------------------------------------------------------
+# Device callback (MacroDroid)
+# ------------------------------------------------------------
 async def handle_health_check(request):
     return web.Response(text="Bot is running live!")
+
 
 async def handle_device_callback(request):
     global device_status, device_event
@@ -896,6 +1285,7 @@ async def handle_device_callback(request):
     device_status = status
     device_event.set()
     return web.Response(text="Callback received successfully")
+
 
 async def start_web_server():
     app = web.Application()
@@ -909,9 +1299,10 @@ async def start_web_server():
     await site.start()
     logger.info("Web Server running on port %s (health + device callbacks)", PORT)
 
-# ----------------------------
+
+# ------------------------------------------------------------
 # Main
-# ----------------------------
+# ------------------------------------------------------------
 async def main():
     await init_db()
     await _load_saved_sessions_on_startup()
@@ -934,6 +1325,7 @@ async def main():
                 await client.disconnect()
             except Exception:
                 pass
+
 
 if __name__ == "__main__":
     asyncio.run(main())
