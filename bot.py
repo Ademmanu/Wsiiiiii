@@ -56,6 +56,8 @@ OTP_SEARCH_DURATION = int(os.getenv("OTP_SEARCH_DURATION", "300"))
 NUMBER_FILE_TTL_HOURS = int(os.getenv("NUMBER_FILE_TTL_HOURS", "48"))
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(5 * 1024 * 1024)))
 FILES_PER_PAGE = 10
+OTP_PICK_PER_PAGE = 10
+PENDING_BATCH_TTL = 1800  # seconds a picked-but-unstarted batch stays valid
 
 router = Router()
 bot_instance: Optional[Bot] = None
@@ -73,6 +75,7 @@ is_paused = False
 current_task: Optional[asyncio.Task] = None
 active_file_id: Optional[int] = None
 _background_tasks: Set[asyncio.Task] = set()
+pending_batches: Dict[int, Dict] = {}  # batch waiting for the user to pick an OTP group
 
 current_index = 0
 total_numbers_count = 0
@@ -899,6 +902,7 @@ async def db_purge_user_data(user_id: int) -> bool:
         async with db_pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute("DELETE FROM otp_groups WHERE user_id = $1", user_id)
+                await conn.execute("DELETE FROM number_files WHERE user_id = $1", user_id)
                 await conn.execute(
                     """
                     UPDATE users
@@ -1360,13 +1364,15 @@ class AutoOTPSearchManager:
         return self._key_locks[key]
 
     async def start_search(self, user_id: int, search_key: str, extracted_number: str,
-                           task_label: str = "") -> Optional[asyncio.Future]:
+                           task_label: str = "", set_name: Optional[str] = None) -> Optional[asyncio.Future]:
         """
         Registers a search and returns a future that resolves to
         (otp, set_name) when found, or None when the search times out / is cancelled.
         Returns None (not a future) if there is nothing to search with.
         """
         otp_sets = otp_sets_cache.get(user_id, [])
+        if set_name is not None:
+            otp_sets = [s for s in otp_sets if s.get('name') == set_name]
         if not otp_sets:
             logger.debug(f"No OTP sets for user {user_id}, skipping search")
             return None
@@ -1403,6 +1409,7 @@ class AutoOTPSearchManager:
                 'cancelled':        False,
                 'found_otp':        False,
                 'future':           future,
+                'backfill_done':    asyncio.Event(),   # set when the history scan has finished (found or not)
             }
 
         logger.info(
@@ -1416,6 +1423,14 @@ class AutoOTPSearchManager:
         return future
 
     async def _run_backfill(self, search_key: str):
+        info = self.searches.get(search_key)
+        try:
+            await self._run_backfill_inner(search_key)
+        finally:
+            if info and info.get('backfill_done') is not None:
+                info['backfill_done'].set()
+
+    async def _run_backfill_inner(self, search_key: str):
         """
         One-shot iter_messages scan covering the last OTP_BACKFILL_WINDOW_SECONDS.
         Catches OTPs that were already posted before the search started.
@@ -3363,6 +3378,7 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     result_live_handler_chat.pop(user_id, None)
     logout_states.pop(user_id, None)
     user_data_store.pop(user_id, None)
+    pending_batches.pop(user_id, None)
 
     await update.message.reply_text(
         "👋 **Account disconnected successfully!**\n\n✅ All your sessions, tasks, and data have been cleared.\n🔄 Use /login to connect again.",
@@ -3389,7 +3405,7 @@ async def start_handler(message: Message):
         "How it works:\n"
         "1) /login and complete the interactive login flow\n"
         "2) /otpgroups to add OTP sets, e.g. HK = 2|TGT|3 = -100123456789\n"
-        "3) Send numbers as text, or send a .txt file, to start a batch (files are saved so you can resume them)\n"
+        "3) Send numbers as text, or send a .txt file, then pick which OTP group to search (or All Groups). Files are saved while you are logged in, so you can resume them\n"
         "4) If the device requests a code, the bot searches your OTP groups (short backfill + live handlers) "
         "for the number-derived pattern and sends the OTP it finds to the device\n"
         "5) When the device says continue, your logged-in account sends the plain number (no forward tag) to the "
@@ -3457,7 +3473,7 @@ async def setchatid_handler(message: Message):
 # Inline buttons (fordet button_handler branches for login / logout /
 # getallid / otpgroups, copied verbatim)
 # ------------------------------------------------------------
-@router.callback_query(~F.data.startswith("nf_"))
+@router.callback_query(~F.data.startswith("nf_"), ~F.data.startswith("otpsel_"))
 async def button_handler(callback: CallbackQuery):
     update, context = ptb_from_callback(callback)
     query = update.callback_query
@@ -3777,7 +3793,22 @@ async def _batch_preconditions(user_id: int) -> Optional[Tuple[str, Optional[str
     return None
 
 
-async def process_number(message: Message, user_id: int, target_chat: Optional[int], num: str) -> None:
+def _scope_label(otp_set_name: Optional[str]) -> str:
+    return otp_set_name if otp_set_name else "All Groups"
+
+
+def _search_interrupt_from_status() -> Optional[str]:
+    """blocked / try_again from the device end the OTP search immediately."""
+    status = (device_status or "").lower()
+    if "blocked" in status:
+        return "blocked"
+    if "try_again" in status:
+        return "try_again"
+    return None
+
+
+async def process_number(message: Message, user_id: int, target_chat: Optional[int], num: str,
+                         otp_set_name: Optional[str] = None) -> None:
     """Runs one number through device check -> OTP search -> send code -> no-tag forward -> SUCCESS/FAILED."""
     global device_status
     num_msg = await message.answer(f"{num} ⏳ Checking on device...")
@@ -3826,40 +3857,71 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
         return
 
     if "request_code" in result_text or "requestcode" in result_text or "request-code" in result_text:
-        await num_msg.edit_text(f"{num} ⚪ Device requested code. Searching OTP groups...")
+        scope_label = _scope_label(otp_set_name)
+        await num_msg.edit_text(f"{num} ⚪ Device requested code. Searching OTP groups ({scope_label})...")
 
         # fordet auto-OTP search: backfill + live handlers, resolves when the OTP shows up
         search_key = f"{user_id}:{num}"
-        fut = await otp_search_manager.start_search(user_id, search_key, num, task_label="batch")
+        fut = await otp_search_manager.start_search(user_id, search_key, num, task_label="batch", set_name=otp_set_name)
         code = None
         set_name = None
+        interrupt = None
 
         if fut is None:
             await num_msg.edit_text(
-                f"{num} ⚠️ No usable OTP search pattern for this number. Check your formats in /otpgroups."
+                f"{num} ⚠️ No usable OTP search pattern for this number ({scope_label}). Check your formats in /otpgroups."
             )
         else:
+            backfill_done = (otp_search_manager.searches.get(search_key) or {}).get('backfill_done')
             deadline = time.time() + OTP_SEARCH_DURATION + 5
+            no_code_sent = False
+            device_event.clear()
+            device_status = None
             try:
-                # wake on: OTP found, /next (skip), /cancel (task cancelled) or the search window ending.
-                # A stray device callback only re-arms the wait.
-                while not fut.done() and not skip_current_number and time.time() < deadline:
+                # keeps searching until: OTP found, device says blocked/try_again, /next, /cancel or timeout.
+                # Any other device callback only re-arms the wait.
+                while True:
+                    interrupt = _search_interrupt_from_status()
+                    if interrupt or fut.done() or skip_current_number or time.time() >= deadline:
+                        break
+
+                    # history scan came back empty: tell the device once ("no_code"), but keep searching
+                    if backfill_done is not None and backfill_done.is_set() and not no_code_sent:
+                        no_code_sent = True
+                        await num_msg.edit_text(f"{num} ⚪ No code yet. Still searching ({scope_label})...")
+                        await call_device_api(num, payload_type="no_code")
+                        continue
+
                     device_event.clear()
-                    skip_waiter = asyncio.ensure_future(device_event.wait())
+                    helpers = [asyncio.ensure_future(device_event.wait())]
+                    if backfill_done is not None and not no_code_sent:
+                        helpers.append(asyncio.ensure_future(backfill_done.wait()))
                     try:
                         await asyncio.wait(
-                            {fut, skip_waiter},
+                            {fut, *helpers},
                             timeout=max(0.0, deadline - time.time()),
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                     finally:
-                        skip_waiter.cancel()
+                        for helper in helpers:
+                            helper.cancel()
             finally:
                 await otp_search_manager.cancel_search(search_key)
 
             if skip_current_number:
                 await num_msg.edit_text(f"{num} ⏭️ Skipped")
                 await log_number_status(num, "skipped")
+                return
+
+            if interrupt == "blocked":
+                await num_msg.edit_text(f"{num} ⚫ Bad")
+                await log_number_status(num, "blocked")
+                return
+
+            if interrupt == "try_again":
+                await num_msg.edit_text(f"{num} 🟡 Try Later")
+                await log_number_status(num, "try_again")
+                await asyncio.sleep(5)
                 return
 
             if fut.done() and not fut.cancelled():
@@ -3869,7 +3931,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
 
             if code:
                 await num_msg.edit_text(
-                    f"{num} ⚪ OTP found (set {set_name}): `{code}`", parse_mode="Markdown"
+                    f"{num} ⚪ OTP found (set {html.escape(set_name)}): <code>{code}</code>", parse_mode="HTML"
                 )
             else:
                 await num_msg.edit_text(
@@ -3938,7 +4000,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
 
 async def run_batch(message: Message, user_id: int, numbers: List[str],
                     file_id: Optional[int] = None, start_index: int = 0,
-                    file_name: Optional[str] = None) -> None:
+                    file_name: Optional[str] = None, otp_set_name: Optional[str] = None) -> None:
     """
     Caller must have won _claim_batch(). Always releases the batch state when done.
     For file batches the position is saved after every finished number, so a /cancel,
@@ -3980,6 +4042,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             header = f"Processing file {file_name}: {total} numbers"
             if start_index:
                 header += f"\nResuming from number {start_index + 1}"
+        header += f"\nOTP group: {_scope_label(otp_set_name)}"
         status_msg = await message.answer(header)
 
         for idx in range(start_index, total):
@@ -3991,7 +4054,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             await pause_event.wait()
             await status_msg.edit_text(f"Processing batch\n\nProgress: {idx + 1}/{total}\nTarget: {num}")
 
-            await process_number(message, user_id, target_chat, num)
+            await process_number(message, user_id, target_chat, num, otp_set_name)
 
             completed = idx + 1
             if file_id is not None:
@@ -4025,6 +4088,152 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
         pause_event.set()
 
 
+# ------------------------------------------------------------
+# OTP group picker: choose which OTP set to search before a batch starts or resumes
+# ("All Groups" searches every set, a specific set searches only that one)
+# ------------------------------------------------------------
+async def offer_batch(message: Message, user_id: int, numbers: List[str],
+                      file_id: Optional[int] = None, start_index: int = 0,
+                      file_name: Optional[str] = None, header: Optional[str] = None) -> None:
+    """Checks the batch can run, remembers it, and shows the OTP group picker."""
+    problem = await _batch_preconditions(user_id)
+    if problem:
+        text, parse_mode = problem
+        if file_id is not None:
+            text += "\n\n📂 Your file is saved — resume it from /numberfiles once this is fixed."
+        await message.answer(text, parse_mode=parse_mode)
+        return
+
+    pending_batches[user_id] = dict(numbers=numbers, file_id=file_id, start_index=start_index,
+                                    file_name=file_name, ts=time.time())
+    text, markup = await build_otp_picker_view(user_id, 0, header)
+    await message.answer(text, reply_markup=markup, parse_mode="HTML")
+
+
+def _pending_summary(p: Dict) -> str:
+    count = f"{len(p['numbers']):,} numbers"
+    if p['file_id'] is None:
+        return f"📝 Pasted batch: {count}"
+    where = f"resuming from number {p['start_index'] + 1}" if p['start_index'] else "from the beginning"
+    return f"📄 <b>{html.escape(p['file_name'])}</b>: {count}, {where}"
+
+
+async def build_otp_picker_view(user_id: int, page: int, header: Optional[str] = None):
+    p = pending_batches.get(user_id)
+    sets = sorted(await db_get_otp_sets(user_id), key=lambda s: s['set_index'])
+    pages = max(1, (len(sets) + OTP_PICK_PER_PAGE - 1) // OTP_PICK_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+
+    lines = []
+    if header:
+        lines += [header, ""]
+    lines += ["🤖 <b>Select OTP Group</b>", ""]
+    if p:
+        lines += [_pending_summary(p), ""]
+    lines += ["Choose which OTP set to search for codes, or <b>All Groups</b> to search every set.", ""]
+
+    keyboard = []
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"otpsel_page_{page - 1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page + 1}/{pages}", callback_data="otpsel_noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"otpsel_page_{page + 1}"))
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("🌐 All Groups", callback_data="otpsel_all")])
+
+    row = []
+    for s in sets[page * OTP_PICK_PER_PAGE:(page + 1) * OTP_PICK_PER_PAGE]:
+        number = s['set_index'] + 1
+        lines.append(
+            f"{number}. <b>{html.escape(s['name'])}</b>\n"
+            f"    🧩 {len(s.get('formats', []))} format(s) • 👥 {len(s.get('group_ids', []))} group(s)"
+        )
+        row.append(InlineKeyboardButton(_btn_label(number, s['name']), callback_data=f"otpsel_{s['set_index']}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="otpsel_cancel")])
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
+@router.callback_query(F.data.startswith("otpsel_"))
+async def otpsel_callback_handler(callback: CallbackQuery):
+    update, context = ptb_from_callback(callback)
+    query = update.callback_query
+    user_id = query.from_user.id
+    action = query.data or ""
+
+    if action == "otpsel_noop":
+        await query.answer()
+        return
+
+    pending = pending_batches.get(user_id)
+    if not pending or time.time() - pending['ts'] > PENDING_BATCH_TTL:
+        pending_batches.pop(user_id, None)
+        await query.answer("This selection expired. Send your numbers or open /numberfiles again.", show_alert=True)
+        try:
+            await query.edit_message_text("⌛ This selection expired.")
+        except Exception:
+            pass
+        return
+
+    if action.startswith("otpsel_page_"):
+        await query.answer()
+        try:
+            page = int(action[len("otpsel_page_"):])
+        except ValueError:
+            page = 0
+        text, markup = await build_otp_picker_view(user_id, page)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+        return
+
+    if action == "otpsel_cancel":
+        pending_batches.pop(user_id, None)
+        await query.answer()
+        await query.edit_message_text("❎ Cancelled. Nothing was started.")
+        return
+
+    # otpsel_all  or  otpsel_<set_index>
+    otp_set_name = None
+    if action != "otpsel_all":
+        try:
+            set_index = int(action[len("otpsel_"):])
+        except ValueError:
+            await query.answer()
+            return
+        match = next((s for s in await db_get_otp_sets(user_id) if s['set_index'] == set_index), None)
+        if not match:
+            await query.answer("That OTP set no longer exists. Pick again.", show_alert=True)
+            text, markup = await build_otp_picker_view(user_id, 0)
+            await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+            return
+        otp_set_name = match['name']
+
+    if not _claim_batch():
+        await query.answer("⚠️ Another batch is running. Use /cancel to stop it first.", show_alert=True)
+        return
+
+    pending_batches.pop(user_id, None)
+    task = asyncio.create_task(run_batch(
+        callback.message, user_id, pending['numbers'],
+        file_id=pending['file_id'], start_index=pending['start_index'],
+        file_name=pending['file_name'], otp_set_name=otp_set_name,
+    ))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    await query.answer()
+    try:
+        await query.edit_message_text(f"✅ OTP group: <b>{html.escape(_scope_label(otp_set_name))}</b>. Starting…",
+                                      parse_mode="HTML")
+    except Exception:
+        pass
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_numbers(message: Message):
     user_id = message.from_user.id
@@ -4039,10 +4248,7 @@ async def handle_numbers(message: Message):
         await message.answer("No valid numbers found in message.")
         return
 
-    if not _claim_batch():
-        await message.answer("Another processing session is running. Use /cancel to stop it first.")
-        return
-    await run_batch(message, user_id, numbers)
+    await offer_batch(message, user_id, numbers)
 
 
 # ------------------------------------------------------------
@@ -4053,6 +4259,13 @@ async def handle_document(message: Message):
     user_id = message.from_user.id
     doc = message.document
     file_name = doc.file_name or "numbers.txt"
+
+    if user_id not in user_clients:
+        await message.answer(
+            "❌ **You need to connect your account first!**\n\nUse /login to connect. Files can only be saved while you're logged in.",
+            parse_mode="Markdown",
+        )
+        return
 
     if not (file_name.lower().endswith(".txt") or (doc.mime_type or "").startswith("text/plain")):
         await message.answer("❌ Please send a plain .txt file (numbers separated by commas, spaces or new lines).")
@@ -4092,15 +4305,15 @@ async def handle_document(message: Message):
         )
         return
 
-    if not _claim_batch():
+    if is_processing:
         await message.answer(
             kept + "\n\nAnother batch is running, so it was not started. Resume it from /numberfiles when it finishes.",
             parse_mode="HTML",
         )
         return
 
-    await message.answer(kept + "\n\nStarting now from the beginning.", parse_mode="HTML")
-    await run_batch(message, user_id, numbers, file_id=saved['id'], start_index=0, file_name=saved['name'])
+    await offer_batch(message, user_id, numbers, file_id=saved['id'], start_index=0, file_name=saved['name'],
+                      header=kept + "\nIt starts from the beginning once you pick an OTP group.")
 
 
 # ------------------------------------------------------------
@@ -4247,6 +4460,9 @@ async def nf_callback_handler(callback: CallbackQuery):
         await show_list(page)
 
     elif action == "nf_add":
+        if user_id not in user_clients:
+            await query.answer("❌ Log in first with /login. Files can only be saved while you're logged in.", show_alert=True)
+            return
         await query.answer()
         context.user_data['nf_action'] = 'adding_file'
         await query.edit_message_text(
@@ -4280,27 +4496,21 @@ async def nf_callback_handler(callback: CallbackQuery):
             await show_list(context.user_data.get('nf_page', 0), "⚠️ That file no longer exists (deleted or expired).")
             return
 
-        if not _claim_batch():
+        if is_processing:
             await query.answer("⚠️ Another batch is running. Use /cancel to stop it first.", show_alert=True)
             return
 
-        start = rec["next_index"] if 0 < rec["next_index"] < rec["total"] else 0
-        task = asyncio.create_task(run_batch(
-            callback.message, user_id, rec["numbers"],
-            file_id=rec["id"], start_index=start, file_name=rec["name"],
-        ))
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+        problem = await _batch_preconditions(user_id)
+        if problem:
+            await query.answer(problem[0].replace("**", "").replace("\n\n", " ")[:190], show_alert=True)
+            return
 
+        start = rec["next_index"] if 0 < rec["next_index"] < rec["total"] else 0
+        pending_batches[user_id] = dict(numbers=rec["numbers"], file_id=rec["id"], start_index=start,
+                                        file_name=rec["name"], ts=time.time())
         await query.answer()
-        where = f"from number {start + 1}" if start else "from the beginning"
-        try:
-            await query.edit_message_text(
-                f"▶️ <b>{html.escape(rec['name'])}</b>: resuming {where}.",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
+        text, markup = await build_otp_picker_view(user_id, 0)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
 
     elif action.startswith("nf_delyes_"):
         fid = file_id_from("nf_delyes_")
