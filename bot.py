@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import logging
 import os
@@ -51,6 +52,11 @@ OTP_BACKFILL_WINDOW_SECONDS = int(os.getenv("OTP_BACKFILL_WINDOW_SECONDS", "10")
 OTP_BACKFILL_MAX_MESSAGES = int(os.getenv("OTP_BACKFILL_MAX_MESSAGES", "10"))
 OTP_SEARCH_DURATION = int(os.getenv("OTP_SEARCH_DURATION", "300"))
 
+# number files (/numberfiles)
+NUMBER_FILE_TTL_HOURS = int(os.getenv("NUMBER_FILE_TTL_HOURS", "48"))
+MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(5 * 1024 * 1024)))
+FILES_PER_PAGE = 10
+
 router = Router()
 bot_instance: Optional[Bot] = None
 
@@ -65,6 +71,8 @@ user_target_chat_ids: dict[int, int] = {}
 is_processing = False
 is_paused = False
 current_task: Optional[asyncio.Task] = None
+active_file_id: Optional[int] = None
+_background_tasks: Set[asyncio.Task] = set()
 
 current_index = 0
 total_numbers_count = 0
@@ -144,6 +152,19 @@ async def init_db():
                     FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE,
                     UNIQUE(user_id, set_index)
                 );
+
+                CREATE TABLE IF NOT EXISTS number_files (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    name TEXT NOT NULL,
+                    numbers JSONB NOT NULL,
+                    total INTEGER NOT NULL,
+                    next_index INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS ix_number_files_user ON number_files (user_id, created_at);
                 """
             )
 
@@ -3266,6 +3287,9 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
 🎯 **Target Chat:**
   /setchatid - Set the SUCCESS/FAILED chat
 
+📂 **Number Files:**
+  /numberfiles - Saved .txt batches (kept 48h)
+
 🆔 **Utilities:**
   /getallid - Get all your chat IDs
 
@@ -3277,6 +3301,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     keyboard = []
     if is_logged_in:
         keyboard.append([InlineKeyboardButton("🤖 OTP Groups", callback_data="otp_main")])
+        keyboard.append([InlineKeyboardButton("📂 Number Files", callback_data="nf_page_0")])
         keyboard.append([InlineKeyboardButton("🔴 Disconnect", callback_data="logout")])
     else:
         keyboard.append([InlineKeyboardButton("🟢 Connect Account", callback_data="login")])
@@ -3358,12 +3383,13 @@ async def start_handler(message: Message):
         "/logout - disconnect and remove your saved session\n"
         "/setchatid <chat_id> - set the target chat that receives numbers and reports SUCCESS/FAILED\n"
         "/otpgroups - manage OTP search sets (Name = pattern = group IDs)\n"
+        "/numberfiles - saved .txt number files (kept 48h, resume where you stopped)\n"
         "/getallid - list the chat IDs of your logged-in account\n"
         "/pause | /resume | /next | /stats | /cancel\n\n"
         "How it works:\n"
         "1) /login and complete the interactive login flow\n"
         "2) /otpgroups to add OTP sets, e.g. HK = 2|TGT|3 = -100123456789\n"
-        "3) Send numbers to start a batch\n"
+        "3) Send numbers as text, or send a .txt file, to start a batch (files are saved so you can resume them)\n"
         "4) If the device requests a code, the bot searches your OTP groups (short backfill + live handlers) "
         "for the number-derived pattern and sends the OTP it finds to the device\n"
         "5) When the device says continue, your logged-in account sends the plain number (no forward tag) to the "
@@ -3431,7 +3457,7 @@ async def setchatid_handler(message: Message):
 # Inline buttons (fordet button_handler branches for login / logout /
 # getallid / otpgroups, copied verbatim)
 # ------------------------------------------------------------
-@router.callback_query()
+@router.callback_query(~F.data.startswith("nf_"))
 async def button_handler(callback: CallbackQuery):
     update, context = ptb_from_callback(callback)
     query = update.callback_query
@@ -3588,223 +3614,724 @@ async def otp_text_handler(message: Message):
 # ------------------------------------------------------------
 # Number processing flow
 # ------------------------------------------------------------
-@router.message(F.text & ~F.text.startswith("/"))
-async def handle_numbers(message: Message):
-    global is_processing, is_paused, current_task, device_status, skip_current_number, current_index, total_numbers_count, active_number
+# ------------------------------------------------------------
+# Number files: persistent .txt batches (kept NUMBER_FILE_TTL_HOURS, default 48h)
+# ------------------------------------------------------------
+def _unique_file_name(name: str, taken: Set[str]) -> str:
+    """'a.txt' -> 'a (2).txt' -> 'a (3).txt' ... when the name is already in use."""
+    if name not in taken:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    i = 2
+    while True:
+        candidate = f"{stem} ({i}){'.' + ext if ext else ''}"
+        if candidate not in taken:
+            return candidate
+        i += 1
 
+
+async def db_add_number_file(user_id: int, name: str, numbers: List[str]) -> Optional[Dict]:
+    if not db_pool:
+        return None
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=NUMBER_FILE_TTL_HOURS)
+    try:
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    "SELECT name FROM number_files WHERE user_id = $1 AND expires_at > NOW()", user_id
+                )
+                final_name = _unique_file_name(name, {r["name"] for r in rows})
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO number_files (user_id, name, numbers, total, next_index, expires_at)
+                    VALUES ($1, $2, $3::jsonb, $4, 0, $5)
+                    RETURNING id, name, total, next_index, created_at, expires_at
+                    """,
+                    user_id, final_name, json.dumps(numbers), len(numbers), expires_at,
+                )
+        return dict(row)
+    except Exception as e:
+        logger.exception(f"Error adding number file for user {user_id}: {e}")
+        return None
+
+
+async def db_list_number_files(user_id: int) -> List[Dict]:
+    if not db_pool:
+        return []
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, name, total, next_index, created_at, expires_at
+                FROM number_files
+                WHERE user_id = $1 AND expires_at > NOW()
+                ORDER BY created_at DESC, id DESC
+                """,
+                user_id,
+            )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.exception(f"Error listing number files for user {user_id}: {e}")
+        return []
+
+
+async def db_get_number_file(user_id: int, file_id: int, with_numbers: bool = False) -> Optional[Dict]:
+    if not db_pool:
+        return None
+    cols = "id, name, total, next_index, created_at, expires_at"
+    if with_numbers:
+        cols += ", numbers::text AS numbers"
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT {cols} FROM number_files WHERE id = $1 AND user_id = $2 AND expires_at > NOW()",
+                file_id, user_id,
+            )
+        if not row:
+            return None
+        rec = dict(row)
+        if with_numbers:
+            rec["numbers"] = json.loads(rec["numbers"])
+        return rec
+    except Exception as e:
+        logger.exception(f"Error getting number file {file_id}: {e}")
+        return None
+
+
+async def db_set_file_progress(file_id: int, next_index: int) -> None:
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE number_files SET next_index = $2 WHERE id = $1", file_id, next_index)
+    except Exception as e:
+        logger.warning(f"Could not save progress for file {file_id}: {e}")
+
+
+async def db_delete_number_file(user_id: int, file_id: int) -> bool:
+    if not db_pool:
+        return False
+    try:
+        async with db_pool.acquire() as conn:
+            status = await conn.execute(
+                "DELETE FROM number_files WHERE id = $1 AND user_id = $2", file_id, user_id
+            )
+        return int(status.split()[-1]) > 0
+    except Exception as e:
+        logger.exception(f"Error deleting number file {file_id}: {e}")
+        return False
+
+
+async def db_purge_expired_files() -> int:
+    if not db_pool:
+        return 0
+    async with db_pool.acquire() as conn:
+        status = await conn.execute("DELETE FROM number_files WHERE expires_at <= NOW()")
+    return int(status.split()[-1])
+
+
+async def _expired_files_cleanup_loop():
+    """Expired files are already invisible (every query filters on expires_at); this frees the storage."""
+    while True:
+        try:
+            purged = await db_purge_expired_files()
+            if purged:
+                logger.info(f"Purged {purged} expired number file(s)")
+        except Exception as e:
+            logger.warning(f"Expired-file cleanup failed: {e}")
+        await asyncio.sleep(600)
+
+
+# ------------------------------------------------------------
+# Batch runner (shared by pasted text, sent files and /numberfiles → Resume)
+# ------------------------------------------------------------
+def parse_numbers(text: str) -> List[str]:
+    return [n.strip() for n in re.split(r"[,\s]+", text) if n.strip()]
+
+
+def decode_file_bytes(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
+
+
+def _claim_batch() -> bool:
+    """Synchronous check-and-set so two requests can never both start a batch."""
+    global is_processing
     if is_processing:
-        await message.answer("Another processing session is running. Use /cancel to stop it first.")
-        return
+        return False
+    is_processing = True
+    return True
 
-    user_id = message.from_user.id
-    target_chat = await _get_user_target_chat(user_id)
-    if target_chat is None:
-        target_chat = target_chat_id
 
-    text = message.text
-    numbers = [n.strip() for n in re.split(r"[,\s]+", text) if n.strip()]
-    if not numbers:
-        await message.answer("No valid numbers found in message.")
-        return
-
+async def _batch_preconditions(user_id: int) -> Optional[Tuple[str, Optional[str]]]:
     if user_id not in user_clients:
-        await message.answer("❌ **You need to connect your account first!**\n\nUse /login to connect.", parse_mode="Markdown")
-        return
-
+        return ("❌ **You need to connect your account first!**\n\nUse /login to connect.", "Markdown")
     if user_id not in otp_sets_cache:
         otp_sets_cache[user_id] = await db_get_otp_sets(user_id)
     if not otp_sets_cache.get(user_id):
-        await message.answer("❌ No OTP sets found! Please configure one using /otpgroups.")
-        return
+        return ("❌ No OTP sets found! Please configure one using /otpgroups.", None)
+    return None
 
-    # make sure the live SUCCESS/FAILED handler is watching the current target chat
-    if target_chat and result_live_handler_chat.get(user_id) != target_chat:
-        await update_result_handler_for_user(user_id)
+
+async def process_number(message: Message, user_id: int, target_chat: Optional[int], num: str) -> None:
+    """Runs one number through device check -> OTP search -> send code -> no-tag forward -> SUCCESS/FAILED."""
+    global device_status
+    num_msg = await message.answer(f"{num} ⏳ Checking on device...")
 
     device_event.clear()
+    device_status = None
 
-    is_processing = True
-    total_numbers_count = len(numbers)
-    current_task = asyncio.current_task()
+    success = await call_device_api(num, payload_type="check")
+    if not success:
+        await num_msg.edit_text(f"{num} 🔴 Error (Webhook failed)")
+        await log_number_status(num, "webhook_error")
+        return
 
     try:
-        status_msg = await message.answer(f"Processing {total_numbers_count} numbers...")
-        for i, num in enumerate(numbers, start=1):
-            current_index = i
-            active_number = num
-            skip_current_number = False
+        await asyncio.wait_for(device_event.wait(), timeout=300)
+    except asyncio.TimeoutError:
+        if skip_current_number:
+            await num_msg.edit_text(f"{num} ⏭️ Skipped")
+            await log_number_status(num, "skipped")
+            return
+        await num_msg.edit_text(f"{num} 🟠 Ended (Device timeout - 5 mins)")
+        await log_number_status(num, "device_timeout")
+        return
 
-            await pause_event.wait()
-            await status_msg.edit_text(f"Processing batch\n\nProgress: {i}/{total_numbers_count}\nTarget: {num}")
-            num_msg = await message.answer(f"{num} ⏳ Checking on device...")
+    if skip_current_number:
+        await num_msg.edit_text(f"{num} ⏭️ Skipped")
+        await log_number_status(num, "skipped")
+        return
 
-            device_event.clear()
-            device_status = None
+    result_text = (device_status or "").lower()
 
-            success = await call_device_api(num, payload_type="check")
-            if not success:
-                await num_msg.edit_text(f"{num} 🔴 Error (Webhook failed)")
-                await log_number_status(num, "webhook_error")
-                continue
+    if "blocked" in result_text:
+        await num_msg.edit_text(f"{num} ⚫ Bad")
+        await log_number_status(num, "blocked")
+        return
 
+    if "try_again" in result_text:
+        await num_msg.edit_text(f"{num} 🟡 Try Later")
+        await log_number_status(num, "try_again")
+        await asyncio.sleep(5)
+        return
+
+    if "error" in result_text and "request_code" not in result_text:
+        await num_msg.edit_text(f"{num} 🔴 Error Code")
+        await log_number_status(num, "error")
+        return
+
+    if "request_code" in result_text or "requestcode" in result_text or "request-code" in result_text:
+        await num_msg.edit_text(f"{num} ⚪ Device requested code. Searching OTP groups...")
+
+        # fordet auto-OTP search: backfill + live handlers, resolves when the OTP shows up
+        search_key = f"{user_id}:{num}"
+        fut = await otp_search_manager.start_search(user_id, search_key, num, task_label="batch")
+        code = None
+        set_name = None
+
+        if fut is None:
+            await num_msg.edit_text(
+                f"{num} ⚠️ No usable OTP search pattern for this number. Check your formats in /otpgroups."
+            )
+        else:
+            deadline = time.time() + OTP_SEARCH_DURATION + 5
             try:
-                await asyncio.wait_for(device_event.wait(), timeout=300)
-            except asyncio.TimeoutError:
-                if skip_current_number:
-                    await num_msg.edit_text(f"{num} ⏭️ Skipped")
-                    await log_number_status(num, "skipped")
-                    continue
-                await num_msg.edit_text(f"{num} 🟠 Ended (Device timeout - 5 mins)")
-                await log_number_status(num, "device_timeout")
-                continue
+                # wake on: OTP found, /next (skip), /cancel (task cancelled) or the search window ending.
+                # A stray device callback only re-arms the wait.
+                while not fut.done() and not skip_current_number and time.time() < deadline:
+                    device_event.clear()
+                    skip_waiter = asyncio.ensure_future(device_event.wait())
+                    try:
+                        await asyncio.wait(
+                            {fut, skip_waiter},
+                            timeout=max(0.0, deadline - time.time()),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        skip_waiter.cancel()
+            finally:
+                await otp_search_manager.cancel_search(search_key)
 
             if skip_current_number:
                 await num_msg.edit_text(f"{num} ⏭️ Skipped")
                 await log_number_status(num, "skipped")
-                continue
+                return
 
-            result_text = (device_status or "").lower()
+            if fut.done() and not fut.cancelled():
+                found = fut.result()
+                if found:
+                    code, set_name = found
 
-            if "blocked" in result_text:
-                await num_msg.edit_text(f"{num} ⚫ Bad")
-                await log_number_status(num, "blocked")
-                continue
-
-            if "try_again" in result_text:
-                await num_msg.edit_text(f"{num} 🟡 Try Later")
-                await log_number_status(num, "try_again")
-                await asyncio.sleep(5)
-                continue
-
-            if "error" in result_text and "request_code" not in result_text:
-                await num_msg.edit_text(f"{num} 🔴 Error Code")
-                await log_number_status(num, "error")
-                continue
-
-            if "request_code" in result_text or "requestcode" in result_text or "request-code" in result_text:
-                await num_msg.edit_text(f"{num} ⚪ Device requested code. Searching OTP groups...")
-
-                # fordet auto-OTP search: backfill + live handlers, resolves when the OTP shows up
-                search_key = f"{user_id}:{num}"
-                fut = await otp_search_manager.start_search(user_id, search_key, num, task_label="batch")
-                code = None
-                set_name = None
-
-                if fut is None:
-                    await num_msg.edit_text(
-                        f"{num} ⚠️ No usable OTP search pattern for this number. Check your formats in /otpgroups."
-                    )
-                else:
-                    deadline = time.time() + OTP_SEARCH_DURATION + 5
-                    try:
-                        # wake on: OTP found, /next (skip), /cancel (task cancelled) or the search window ending.
-                        # A stray device callback only re-arms the wait.
-                        while not fut.done() and not skip_current_number and time.time() < deadline:
-                            device_event.clear()
-                            skip_waiter = asyncio.ensure_future(device_event.wait())
-                            try:
-                                await asyncio.wait(
-                                    {fut, skip_waiter},
-                                    timeout=max(0.0, deadline - time.time()),
-                                    return_when=asyncio.FIRST_COMPLETED,
-                                )
-                            finally:
-                                skip_waiter.cancel()
-                    finally:
-                        await otp_search_manager.cancel_search(search_key)
-
-                    if skip_current_number:
-                        await num_msg.edit_text(f"{num} ⏭️ Skipped")
-                        await log_number_status(num, "skipped")
-                        continue
-
-                    if fut.done() and not fut.cancelled():
-                        found = fut.result()
-                        if found:
-                            code, set_name = found
-
-                    if code:
-                        await num_msg.edit_text(
-                            f"{num} ⚪ OTP found (set {set_name}): `{code}`", parse_mode="Markdown"
-                        )
-                    else:
-                        await num_msg.edit_text(
-                            f"{num} ⚠️ Could not find OTP in your OTP groups. Please ensure your logged-in account is a member and can read them."
-                        )
-
-                if not code:
-                    await num_msg.edit_text(f"{num} 🔴 No OTP available. Skipping.")
-                    await log_number_status(num, "no_otp_found")
-                    continue
-
-                device_event.clear()
-                device_status = None
-                await call_device_api(num, payload_type="send_code", code=code)
-
-                try:
-                    await asyncio.wait_for(device_event.wait(), timeout=300)
-                    if skip_current_number:
-                        await num_msg.edit_text(f"{num} ⏭️ Skipped")
-                        await log_number_status(num, "skipped")
-                        continue
-                except asyncio.TimeoutError:
-                    if skip_current_number:
-                        await num_msg.edit_text(f"{num} ⏭️ Skipped")
-                        await log_number_status(num, "skipped")
-                        continue
-                    await num_msg.edit_text(f"{num} 🟠 Ended (Device timeout after sending code - 5 mins)")
-                    await log_number_status(num, "device_timeout_after_code")
-                    continue
-
-            result_after = (device_status or "").lower()
-            if "continue" not in result_after and "continued" not in result_after and "proceed" not in result_after:
-                await num_msg.edit_text(f"{num} ⚠️ Device did not signal to continue. Status: `{device_status}`", parse_mode="Markdown")
-                await log_number_status(num, "no_continue")
-                continue
-
-            await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting SUCCESS/FAILED...")
-
-            if target_chat:
-                key = (user_id, num)
-                ev = asyncio.Event()
-                # register the waiter BEFORE sending so a fast SUCCESS/FAILED can't be missed
-                live_success_failure_events[key] = ev
-                live_success_failure_results.pop(key, None)
-                try:
-                    ok, reason = await forward_message_direct(user_id, target_chat, num)
-                    if not ok:
-                        logger.error("Failed to forward to target chat %s (%s)", target_chat, reason)
-                        await num_msg.edit_text(f"{num} ❌ Error forwarding to target chat ID.")
-                        continue
-
-                    try:
-                        await asyncio.wait_for(ev.wait(), timeout=300)
-                        decision = live_success_failure_results.get(key, "UNKNOWN")
-                        await num_msg.edit_text(f"{num} 🏁 Result Decided: {decision}")
-                        await log_number_status(num, decision.lower())
-                    except asyncio.TimeoutError:
-                        await num_msg.edit_text(f"{num} 🟠 Live decision timeout (No SUCCESS/FAILED received)")
-                        await log_number_status(num, "decision_timeout")
-                finally:
-                    live_success_failure_events.pop(key, None)
-                    live_success_failure_results.pop(key, None)
+            if code:
+                await num_msg.edit_text(
+                    f"{num} ⚪ OTP found (set {set_name}): `{code}`", parse_mode="Markdown"
+                )
             else:
-                await num_msg.edit_text(f"{num} ⚠️ Target chat ID not set! Use /setchatid.")
+                await num_msg.edit_text(
+                    f"{num} ⚠️ Could not find OTP in your OTP groups. Please ensure your logged-in account is a member and can read them."
+                )
 
-        await status_msg.edit_text(f"Batch completed.\nProcessed: {total_numbers_count}/{total_numbers_count}")
+        if not code:
+            await num_msg.edit_text(f"{num} 🔴 No OTP available. Skipping.")
+            await log_number_status(num, "no_otp_found")
+            return
+
+        device_event.clear()
+        device_status = None
+        await call_device_api(num, payload_type="send_code", code=code)
+
+        try:
+            await asyncio.wait_for(device_event.wait(), timeout=300)
+            if skip_current_number:
+                await num_msg.edit_text(f"{num} ⏭️ Skipped")
+                await log_number_status(num, "skipped")
+                return
+        except asyncio.TimeoutError:
+            if skip_current_number:
+                await num_msg.edit_text(f"{num} ⏭️ Skipped")
+                await log_number_status(num, "skipped")
+                return
+            await num_msg.edit_text(f"{num} 🟠 Ended (Device timeout after sending code - 5 mins)")
+            await log_number_status(num, "device_timeout_after_code")
+            return
+
+    result_after = (device_status or "").lower()
+    if "continue" not in result_after and "continued" not in result_after and "proceed" not in result_after:
+        await num_msg.edit_text(f"{num} ⚠️ Device did not signal to continue. Status: `{device_status}`", parse_mode="Markdown")
+        await log_number_status(num, "no_continue")
+        return
+
+    await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting SUCCESS/FAILED...")
+
+    if target_chat:
+        key = (user_id, num)
+        ev = asyncio.Event()
+        # register the waiter BEFORE sending so a fast SUCCESS/FAILED can't be missed
+        live_success_failure_events[key] = ev
+        live_success_failure_results.pop(key, None)
+        try:
+            ok, reason = await forward_message_direct(user_id, target_chat, num)
+            if not ok:
+                logger.error("Failed to forward to target chat %s (%s)", target_chat, reason)
+                await num_msg.edit_text(f"{num} ❌ Error forwarding to target chat ID.")
+                return
+
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=300)
+                decision = live_success_failure_results.get(key, "UNKNOWN")
+                await num_msg.edit_text(f"{num} 🏁 Result Decided: {decision}")
+                await log_number_status(num, decision.lower())
+            except asyncio.TimeoutError:
+                await num_msg.edit_text(f"{num} 🟠 Live decision timeout (No SUCCESS/FAILED received)")
+                await log_number_status(num, "decision_timeout")
+        finally:
+            live_success_failure_events.pop(key, None)
+            live_success_failure_results.pop(key, None)
+    else:
+        await num_msg.edit_text(f"{num} ⚠️ Target chat ID not set! Use /setchatid.")
+
+
+async def run_batch(message: Message, user_id: int, numbers: List[str],
+                    file_id: Optional[int] = None, start_index: int = 0,
+                    file_name: Optional[str] = None) -> None:
+    """
+    Caller must have won _claim_batch(). Always releases the batch state when done.
+    For file batches the position is saved after every finished number, so a /cancel,
+    crash or restart resumes at the number that was in flight (it is redone, never skipped).
+    """
+    global is_processing, is_paused, current_task, skip_current_number, current_index, \
+        total_numbers_count, active_number, active_file_id
+
+    total = len(numbers)
+    completed = start_index
+    try:
+        problem = await _batch_preconditions(user_id)
+        if problem:
+            text, parse_mode = problem
+            if file_id is not None:
+                text += "\n\n📂 Your file is saved — resume it from /numberfiles once this is fixed."
+            await message.answer(text, parse_mode=parse_mode)
+            return
+
+        target_chat = await _get_user_target_chat(user_id)
+        if target_chat is None:
+            target_chat = target_chat_id
+
+        # make sure the live SUCCESS/FAILED handler is watching the current target chat
+        if target_chat and result_live_handler_chat.get(user_id) != target_chat:
+            await update_result_handler_for_user(user_id)
+
+        device_event.clear()
+        total_numbers_count = total
+        current_task = asyncio.current_task()
+        active_file_id = file_id
+
+        if file_id is not None and start_index == 0:
+            await db_set_file_progress(file_id, 0)
+
+        if file_id is None:
+            header = f"Processing {total} numbers..."
+        else:
+            header = f"Processing file {file_name}: {total} numbers"
+            if start_index:
+                header += f"\nResuming from number {start_index + 1}"
+        status_msg = await message.answer(header)
+
+        for idx in range(start_index, total):
+            num = numbers[idx]
+            current_index = idx + 1
+            active_number = num
+            skip_current_number = False
+
+            await pause_event.wait()
+            await status_msg.edit_text(f"Processing batch\n\nProgress: {idx + 1}/{total}\nTarget: {num}")
+
+            await process_number(message, user_id, target_chat, num)
+
+            completed = idx + 1
+            if file_id is not None:
+                await db_set_file_progress(file_id, completed)
+
+        done_text = f"Batch completed.\nProcessed: {total}/{total}"
+        if file_name:
+            done_text += f"\n📂 File: {file_name}"
+        await status_msg.edit_text(done_text)
 
     except asyncio.CancelledError:
         logger.info("Task cancelled by user request.")
+        if file_id is not None:
+            try:
+                await message.answer(f"⏹️ Stopped at {completed}/{total}. Open /numberfiles to resume {file_name}.")
+            except Exception:
+                pass
     except Exception:
         logger.exception("Error during processing")
-        await message.answer("An error occurred during processing.")
+        try:
+            await message.answer("An error occurred during processing.")
+        except Exception:
+            pass
     finally:
         is_processing = False
         is_paused = False
         current_task = None
         active_number = None
+        active_file_id = None
         skip_current_number = False
         pause_event.set()
+
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def handle_numbers(message: Message):
+    user_id = message.from_user.id
+    user_data_store.get(user_id, {}).pop('nf_action', None)
+
+    if is_processing:
+        await message.answer("Another processing session is running. Use /cancel to stop it first.")
+        return
+
+    numbers = parse_numbers(message.text)
+    if not numbers:
+        await message.answer("No valid numbers found in message.")
+        return
+
+    if not _claim_batch():
+        await message.answer("Another processing session is running. Use /cancel to stop it first.")
+        return
+    await run_batch(message, user_id, numbers)
+
+
+# ------------------------------------------------------------
+# Files sent to the bot
+# ------------------------------------------------------------
+@router.message(F.document)
+async def handle_document(message: Message):
+    user_id = message.from_user.id
+    doc = message.document
+    file_name = doc.file_name or "numbers.txt"
+
+    if not (file_name.lower().endswith(".txt") or (doc.mime_type or "").startswith("text/plain")):
+        await message.answer("❌ Please send a plain .txt file (numbers separated by commas, spaces or new lines).")
+        return
+
+    if doc.file_size and doc.file_size > MAX_FILE_BYTES:
+        await message.answer(f"❌ That file is too large (limit {MAX_FILE_BYTES // (1024 * 1024)} MB).")
+        return
+
+    try:
+        buf = await get_bot().download(doc)
+        text = decode_file_bytes(buf.getvalue())
+    except Exception as e:
+        logger.warning(f"Could not download file for user {user_id}: {e}")
+        await message.answer("❌ Couldn't download that file. Please try again.")
+        return
+
+    numbers = parse_numbers(text)
+    if not numbers:
+        await message.answer("❌ No numbers found in that file.")
+        return
+
+    saved = await db_add_number_file(user_id, file_name, numbers)
+    if not saved:
+        await message.answer("❌ Couldn't save that file. Please try again.")
+        return
+
+    add_only = user_data_store.get(user_id, {}).pop('nf_action', None) == 'adding_file'
+    kept = (f"✅ <b>{html.escape(saved['name'])}</b> saved: {saved['total']:,} numbers, "
+            f"kept for {NUMBER_FILE_TTL_HOURS} hours.")
+
+    if add_only:
+        await message.answer(
+            kept + "\n\nOpen it from /numberfiles whenever you want to start.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📂 Number Files", callback_data="nf_page_0")]]),
+        )
+        return
+
+    if not _claim_batch():
+        await message.answer(
+            kept + "\n\nAnother batch is running, so it was not started. Resume it from /numberfiles when it finishes.",
+            parse_mode="HTML",
+        )
+        return
+
+    await message.answer(kept + "\n\nStarting now from the beginning.", parse_mode="HTML")
+    await run_batch(message, user_id, numbers, file_id=saved['id'], start_index=0, file_name=saved['name'])
+
+
+# ------------------------------------------------------------
+# /numberfiles UI
+# ------------------------------------------------------------
+def _fmt_time_left(expires_at) -> str:
+    secs = int((expires_at - datetime.now(timezone.utc)).total_seconds())
+    if secs <= 0:
+        return "expired"
+    hours, minutes = divmod(secs // 60, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m" if minutes else "<1m"
+
+
+def _file_progress_text(rec: Dict) -> str:
+    total, done = rec["total"], rec["next_index"]
+    if is_processing and active_file_id == rec["id"]:
+        return "🔄 running"
+    if done <= 0:
+        return "🆕 not started"
+    if done >= total:
+        return "✅ completed"
+    return f"▶️ {done:,}/{total:,} ({done * 100 // total}%)"
+
+
+def _btn_label(number: int, name: str) -> str:
+    label = f"{number}. {name}"
+    return label if len(label) <= 26 else label[:25] + "…"
+
+
+async def build_numberfiles_view(user_id: int, page: int, notice: Optional[str] = None):
+    files = await db_list_number_files(user_id)
+    pages = max(1, (len(files) + FILES_PER_PAGE - 1) // FILES_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    user_data_store.setdefault(user_id, {})['nf_page'] = page
+
+    keyboard = [[InlineKeyboardButton("➕ Add File", callback_data="nf_add")]]
+    lines = []
+    if notice:
+        lines += [notice, ""]
+
+    if not files:
+        lines += [
+            "📂 <b>Number Files</b>", "",
+            "No files in memory yet.", "",
+            "Tap ➕ Add File, or just send a .txt file to start processing it right away.",
+            f"Files are kept for {NUMBER_FILE_TTL_HOURS} hours.",
+        ]
+        return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+    lines += [f"📂 <b>Number Files</b> ({len(files)} total), page {page + 1}/{pages}", ""]
+    row = []
+    for offset, rec in enumerate(files[page * FILES_PER_PAGE:(page + 1) * FILES_PER_PAGE]):
+        number = page * FILES_PER_PAGE + offset + 1
+        lines.append(
+            f"{number}. <b>{html.escape(rec['name'])}</b>\n"
+            f"    🔢 {rec['total']:,} • {_file_progress_text(rec)} • ⏳ {_fmt_time_left(rec['expires_at'])}"
+        )
+        row.append(InlineKeyboardButton(_btn_label(number, rec['name']), callback_data=f"nf_open_{rec['id']}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"nf_page_{page - 1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page + 1}/{pages}", callback_data="nf_noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"nf_page_{page + 1}"))
+        keyboard.append(nav)
+
+    lines += ["", "Tap a file to resume or delete it."]
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
+async def build_file_view(user_id: int, file_id: int):
+    rec = await db_get_number_file(user_id, file_id)
+    if not rec:
+        return None
+    total, done = rec["total"], rec["next_index"]
+    if is_processing and active_file_id == file_id:
+        resume_hint = "🔄 This file is being processed right now."
+    elif 0 < done < total:
+        resume_hint = f"Resume continues from number {done + 1}."
+    elif done >= total:
+        resume_hint = "Finished. Resume starts it over from the beginning."
+    else:
+        resume_hint = "Resume starts from the beginning."
+
+    text = (
+        f"📄 <b>{html.escape(rec['name'])}</b>\n\n"
+        f"🔢 Numbers: {total:,}\n"
+        f"📊 Progress: {_file_progress_text(rec)}\n"
+        f"⏳ Expires in: {_fmt_time_left(rec['expires_at'])}\n\n"
+        f"{resume_hint}"
+    )
+    page = user_data_store.get(user_id, {}).get('nf_page', 0)
+    keyboard = [
+        [InlineKeyboardButton("▶️ Resume", callback_data=f"nf_resume_{file_id}"),
+         InlineKeyboardButton("🗑 Delete", callback_data=f"nf_del_{file_id}")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"nf_page_{page}")],
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+@router.message(Command("numberfiles"))
+async def numberfiles_command(message: Message):
+    user_data_store.get(message.from_user.id, {}).pop('nf_action', None)
+    text, markup = await build_numberfiles_view(message.from_user.id, 0)
+    await message.answer(text, reply_markup=markup, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("nf_"))
+async def nf_callback_handler(callback: CallbackQuery):
+    update, context = ptb_from_callback(callback)
+    query = update.callback_query
+    user_id = query.from_user.id
+    action = query.data or ""
+
+    async def show_list(page: int, notice: Optional[str] = None):
+        text, markup = await build_numberfiles_view(user_id, page, notice)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
+    def file_id_from(prefix: str) -> Optional[int]:
+        try:
+            return int(action[len(prefix):])
+        except ValueError:
+            return None
+
+    if action == "nf_noop":
+        await query.answer()
+
+    elif action.startswith("nf_page_"):
+        await query.answer()
+        try:
+            page = int(action[len("nf_page_"):])
+        except ValueError:
+            page = 0
+        context.user_data.pop('nf_action', None)
+        await show_list(page)
+
+    elif action == "nf_add":
+        await query.answer()
+        context.user_data['nf_action'] = 'adding_file'
+        await query.edit_message_text(
+            "➕ <b>Add File</b>\n\n"
+            "Send me a .txt file with your numbers (separated by commas, spaces or new lines).\n\n"
+            f"It will be saved for {NUMBER_FILE_TTL_HOURS} hours. Nothing starts until you resume it.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="nf_addcancel")]]),
+            parse_mode="HTML",
+        )
+
+    elif action == "nf_addcancel":
+        await query.answer()
+        context.user_data.pop('nf_action', None)
+        await show_list(context.user_data.get('nf_page', 0))
+
+    elif action.startswith("nf_open_"):
+        await query.answer()
+        fid = file_id_from("nf_open_")
+        view = await build_file_view(user_id, fid) if fid is not None else None
+        if not view:
+            await show_list(context.user_data.get('nf_page', 0), "⚠️ That file no longer exists (deleted or expired).")
+        else:
+            text, markup = view
+            await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
+    elif action.startswith("nf_resume_"):
+        fid = file_id_from("nf_resume_")
+        rec = await db_get_number_file(user_id, fid, with_numbers=True) if fid is not None else None
+        if not rec:
+            await query.answer()
+            await show_list(context.user_data.get('nf_page', 0), "⚠️ That file no longer exists (deleted or expired).")
+            return
+
+        if not _claim_batch():
+            await query.answer("⚠️ Another batch is running. Use /cancel to stop it first.", show_alert=True)
+            return
+
+        start = rec["next_index"] if 0 < rec["next_index"] < rec["total"] else 0
+        task = asyncio.create_task(run_batch(
+            callback.message, user_id, rec["numbers"],
+            file_id=rec["id"], start_index=start, file_name=rec["name"],
+        ))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+        await query.answer()
+        where = f"from number {start + 1}" if start else "from the beginning"
+        try:
+            await query.edit_message_text(
+                f"▶️ <b>{html.escape(rec['name'])}</b>: resuming {where}.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    elif action.startswith("nf_delyes_"):
+        fid = file_id_from("nf_delyes_")
+        if fid is not None and is_processing and active_file_id == fid:
+            await query.answer("⚠️ This file is being processed. Use /cancel first.", show_alert=True)
+            return
+        await query.answer()
+        rec = await db_get_number_file(user_id, fid) if fid is not None else None
+        deleted = rec is not None and await db_delete_number_file(user_id, fid)
+        notice = f"🗑 Deleted <b>{html.escape(rec['name'])}</b>." if deleted else "⚠️ That file no longer exists."
+        await show_list(context.user_data.get('nf_page', 0), notice)
+
+    elif action.startswith("nf_del_"):
+        await query.answer()
+        fid = file_id_from("nf_del_")
+        rec = await db_get_number_file(user_id, fid) if fid is not None else None
+        if not rec:
+            await show_list(context.user_data.get('nf_page', 0), "⚠️ That file no longer exists (deleted or expired).")
+            return
+        await query.edit_message_text(
+            f"🗑 Delete <b>{html.escape(rec['name'])}</b>?\n\n"
+            "This removes the file and its saved progress. It can't be undone.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Yes, delete", callback_data=f"nf_delyes_{fid}"),
+                InlineKeyboardButton("❌ No", callback_data=f"nf_open_{fid}"),
+            ]]),
+            parse_mode="HTML",
+        )
+
+    else:
+        await query.answer()
 
 
 # ------------------------------------------------------------
@@ -3812,13 +4339,16 @@ async def handle_numbers(message: Message):
 # ------------------------------------------------------------
 @router.message(Command("cancel"))
 async def cancel_handler(message: Message):
-    global is_processing, current_task, skip_current_number
+    global skip_current_number
     if is_processing and current_task:
-        current_task.cancel()
-        is_processing = False
-        device_event.set()
+        task = current_task
         skip_current_number = True
+        device_event.set()
         pause_event.set()
+        task.cancel()
+        # wait for the batch to finish unwinding (it releases is_processing itself) so a
+        # Resume tapped right after /cancel can't overlap with the old run
+        await asyncio.wait({task}, timeout=10)
         await message.answer("Batch cancelled successfully.")
     else:
         await message.answer("No active processing session to cancel.")
@@ -3902,6 +4432,7 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     bot_instance = bot
     await _load_saved_sessions_on_startup()
+    cleanup_task = asyncio.create_task(_expired_files_cleanup_loop())
 
     dp = Dispatcher()
     dp.include_router(router)
@@ -3913,6 +4444,7 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
+        cleanup_task.cancel()
         if db_pool:
             await db_pool.close()
         for client in list(user_clients.values()):
