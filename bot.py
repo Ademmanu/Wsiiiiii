@@ -58,9 +58,9 @@ MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(5 * 1024 * 1024)))
 FILES_PER_PAGE = 10
 OTP_PICK_PER_PAGE = 10
 PENDING_BATCH_TTL = 600  # seconds a picked-but-unstarted batch stays valid (10 minutes)
-NO_CODE_AFTER_SECONDS = int(os.getenv("NO_CODE_AFTER_SECONDS", "30"))  # tell the device "no_code" after this long without a code
+NO_CODE_AFTER_SECONDS = int(os.getenv("NO_CODE_AFTER_SECONDS", "40"))  # tell the device "no_code" after this long without a code
 DEVICE_STATE_WAIT_SECONDS = 300  # the 5-minute device state wait
-NEXT_NUMBER_DELAY_SECONDS = float(os.getenv("NEXT_NUMBER_DELAY_SECONDS", "2"))  # pause between numbers, however the last one ended
+NEXT_NUMBER_DELAY_SECONDS = float(os.getenv("NEXT_NUMBER_DELAY_SECONDS", "3"))  # pause between numbers, however the last one ended
 
 router = Router()
 bot_instance: Optional[Bot] = None
@@ -88,6 +88,7 @@ device_event = asyncio.Event()
 device_status: Optional[str] = None
 
 skip_current_number = False
+stop_requested = False  # set by /stop; every wait in the number flow checks it
 pause_event = asyncio.Event()
 pause_event.set()
 
@@ -3392,7 +3393,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
   /getallid - Get all your chat IDs
 
 ⚙️ **Batch Control:**
-  /pause | /resume | /next | /stats | /cancel
+  /pause | /resume | /next | /stats | /stop
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
@@ -3484,13 +3485,13 @@ async def start_handler(message: Message):
         "/otpgroups - manage OTP search sets (Name = pattern = group IDs)\n"
         "/numberfiles - saved .txt number files (kept 48h, resume where you stopped)\n"
         "/getallid - list the chat IDs of your logged-in account\n"
-        "/pause | /resume | /next | /stats | /cancel\n\n"
+        "/pause | /resume | /next | /stats | /stop\n\n"
         "How it works:\n"
         "1) /login and complete the interactive login flow\n"
         "2) /otpgroups to add OTP sets, e.g. HK = 2|TGT|3 = -100123456789\n"
         "3) Send numbers as text, or send a .txt file, then pick which OTP group to search (or All Groups). Files are saved while you are logged in, so you can resume them\n"
         "4) If the device requests a code, the bot searches your OTP groups (short backfill + live handlers) "
-        "for the number-derived pattern and sends the OTP it finds to the device. After 30s without a code the "
+        f"for the number-derived pattern and sends the OTP it finds to the device. After {NO_CODE_AFTER_SECONDS}s without a code the "
         "device gets no_code and the search keeps going. blocked / try_again end the number at any point.\n"
         "5) After the code is sent the bot waits for the device (up to 5 minutes): continue starts the chat check, "
         "error searches for a new code.\n"
@@ -3900,6 +3901,29 @@ async def _batch_preconditions(user_id: int) -> Optional[Tuple[str, Optional[str
     return None
 
 
+class BatchStopped(Exception):
+    """Raised inside the number flow once /stop was requested."""
+
+
+def _raise_if_stopped() -> None:
+    if stop_requested:
+        raise BatchStopped()
+
+
+async def _wait_event(event: asyncio.Event, timeout: float) -> bool:
+    """
+    Waits for an event: True if it was set, False on timeout. Unlike asyncio.wait_for it can never swallow
+    a /stop: on Python < 3.12 wait_for returns normally when the awaited event fires at the same moment the
+    task is cancelled, which turned a cancel into a silent skip of the number.
+    """
+    waiter = asyncio.ensure_future(event.wait())
+    try:
+        done, _ = await asyncio.wait({waiter}, timeout=max(0.0, timeout))
+        return waiter in done
+    finally:
+        waiter.cancel()
+
+
 def _scope_label(otp_set_name: Optional[str]) -> str:
     return otp_set_name if otp_set_name else "All Groups"
 
@@ -3933,6 +3957,7 @@ async def _wait_device_state(deadline: float) -> str:
     """Waits (inside the 5-minute device state wait) until the device answers.
     Returns blocked | try_again | error | continue | skip | timeout. Other callbacks are ignored."""
     while True:
+        _raise_if_stopped()
         state = _device_state_from_status()
         if state:
             return state
@@ -3942,17 +3967,14 @@ async def _wait_device_state(deadline: float) -> str:
         if remaining <= 0:
             return "timeout"
         device_event.clear()
-        try:
-            await asyncio.wait_for(device_event.wait(), timeout=remaining)
-        except asyncio.TimeoutError:
-            pass
+        await _wait_event(device_event, remaining)
 
 
 async def _search_for_otp(num_msg, user_id: int, num: str, otp_set_name: Optional[str], duration: float,
                           exclude: Set[str], hard_deadline: Optional[float] = None) -> Dict:
     """
     One OTP search. Keeps going until a code is found, the device says blocked / try_again,
-    /next, /cancel or the time is up. After NO_CODE_AFTER_SECONDS without a code the device is told
+    /next, /stop or the time is up. After NO_CODE_AFTER_SECONDS without a code the device is told
     "no_code" once, and the search keeps running. Any other device callback only re-arms the wait.
     Returns {"outcome": found | blocked | try_again | skip | none | nopattern, ...}.
     """
@@ -3977,6 +3999,7 @@ async def _search_for_otp(num_msg, user_id: int, num: str, otp_set_name: Optiona
     device_status = None
     try:
         while True:
+            _raise_if_stopped()
             interrupt = _search_interrupt_from_status()
             if interrupt or fut.done() or skip_current_number or time.time() >= deadline:
                 break
@@ -4060,6 +4083,7 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
             f"{num} ⚪ OTP found (set {html.escape(set_name)}): <code>{code}</code>", parse_mode="HTML"
         )
 
+        _raise_if_stopped()
         device_event.clear()
         device_status = None
         await call_device_api(num, payload_type="send_code", code=code)
@@ -4101,9 +4125,9 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
         await log_number_status(num, "webhook_error")
         return
 
-    try:
-        await asyncio.wait_for(device_event.wait(), timeout=DEVICE_STATE_WAIT_SECONDS)
-    except asyncio.TimeoutError:
+    got_answer = await _wait_event(device_event, DEVICE_STATE_WAIT_SECONDS)
+    _raise_if_stopped()
+    if not got_answer:
         if skip_current_number:
             await num_msg.edit_text(f"{num} ⏭️ Skipped")
             await log_number_status(num, "skipped")
@@ -4144,6 +4168,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
             await log_number_status(num, "no_continue")
             return
 
+    _raise_if_stopped()
     await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting SUCCESS/FAILED/BANNED...")
 
     if not target_chat:
@@ -4158,6 +4183,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
     live_success_failure_state[key] = {"sent_id": None, "buffer": []}
     try:
         sent_info: dict = {}
+        _raise_if_stopped()
         ok, reason = await forward_message_direct(user_id, target_chat, num, sent_info)
         if not ok:
             logger.error("Failed to forward to target chat %s (%s)", target_chat, reason)
@@ -4165,14 +4191,15 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
             return
         arm_result_waiter(key, sent_info.get("message_id"))
 
-        try:
-            await asyncio.wait_for(ev.wait(), timeout=DEVICE_STATE_WAIT_SECONDS)
+        got_result = await _wait_event(ev, DEVICE_STATE_WAIT_SECONDS)
+        _raise_if_stopped()
+        if got_result:
             decision = live_success_failure_results.get(key, "UNKNOWN")
             await num_msg.edit_text(f"{num} 🏁 Result Decided: {decision}")
             await log_number_status(num, decision.lower())
             # SUCCESS, FAILED or BANNED: tell the device to clear, then on to the next number
             await call_device_api(num, payload_type="clear")
-        except asyncio.TimeoutError:
+        else:
             await num_msg.edit_text(f"{num} 🟠 Live decision timeout (No SUCCESS/FAILED/BANNED received)")
             await log_number_status(num, "decision_timeout")
     finally:
@@ -4186,14 +4213,15 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
                     file_name: Optional[str] = None, otp_set_name: Optional[str] = None) -> None:
     """
     Caller must have won _claim_batch(). Always releases the batch state when done.
-    For file batches the position is saved after every finished number, so a /cancel,
+    For file batches the position is saved after every finished number, so a /stop,
     crash or restart resumes at the number that was in flight (it is redone, never skipped).
     """
     global is_processing, is_paused, current_task, skip_current_number, current_index, \
-        total_numbers_count, active_number, active_file_id
+        total_numbers_count, active_number, active_file_id, stop_requested
 
     total = len(numbers)
     completed = start_index
+    stop_requested = False
     try:
         problem = await _batch_preconditions(user_id)
         if problem:
@@ -4229,12 +4257,14 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
         status_msg = await message.answer(header)
 
         for idx in range(start_index, total):
+            _raise_if_stopped()
             num = numbers[idx]
             current_index = idx + 1
             active_number = num
             skip_current_number = False
 
             await pause_event.wait()
+            _raise_if_stopped()
             await status_msg.edit_text(f"Processing batch\n\nProgress: {idx + 1}/{total}\nTarget: {num}")
 
             await process_number(message, user_id, target_chat, num, otp_set_name)
@@ -4242,6 +4272,8 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             completed = idx + 1
             if file_id is not None:
                 await db_set_file_progress(file_id, completed)
+
+            _raise_if_stopped()
 
             # same short pause after every number, however it ended
             if idx < total - 1 and NEXT_NUMBER_DELAY_SECONDS > 0:
@@ -4252,8 +4284,8 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             done_text += f"\n📂 File: {file_name}"
         await status_msg.edit_text(done_text)
 
-    except asyncio.CancelledError:
-        logger.info("Task cancelled by user request.")
+    except (asyncio.CancelledError, BatchStopped):
+        logger.info("Batch stopped by user request.")
         if file_id is not None:
             try:
                 await message.answer(f"⏹️ Stopped at {completed}/{total}. Open /numberfiles to resume {file_name}.")
@@ -4272,6 +4304,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
         active_number = None
         active_file_id = None
         skip_current_number = False
+        stop_requested = False
         pause_event.set()
 
 
@@ -4401,7 +4434,7 @@ async def otpsel_callback_handler(callback: CallbackQuery):
         otp_set_name = match['name']
 
     if not _claim_batch():
-        await query.answer("⚠️ Another batch is running. Use /cancel to stop it first.", show_alert=True)
+        await query.answer("⚠️ Another batch is running. Use /stop to stop it first.", show_alert=True)
         return
 
     pending_batches.pop(user_id, None)
@@ -4427,7 +4460,7 @@ async def handle_numbers(message: Message):
     user_data_store.get(user_id, {}).pop('nf_action', None)
 
     if is_processing:
-        await message.answer("Another processing session is running. Use /cancel to stop it first.")
+        await message.answer("Another processing session is running. Use /stop to stop it first.")
         return
 
     numbers = parse_numbers(message.text)
@@ -4684,7 +4717,7 @@ async def nf_callback_handler(callback: CallbackQuery):
             return
 
         if is_processing:
-            await query.answer("⚠️ Another batch is running. Use /cancel to stop it first.", show_alert=True)
+            await query.answer("⚠️ Another batch is running. Use /stop to stop it first.", show_alert=True)
             return
 
         problem = await _batch_preconditions(user_id)
@@ -4702,7 +4735,7 @@ async def nf_callback_handler(callback: CallbackQuery):
     elif action.startswith("nf_delyes_"):
         fid = file_id_from("nf_delyes_")
         if fid is not None and is_processing and active_file_id == fid:
-            await query.answer("⚠️ This file is being processed. Use /cancel first.", show_alert=True)
+            await query.answer("⚠️ This file is being processed. Use /stop first.", show_alert=True)
             return
         await query.answer()
         rec = await db_get_number_file(user_id, fid) if fid is not None else None
@@ -4732,23 +4765,32 @@ async def nf_callback_handler(callback: CallbackQuery):
 
 
 # ------------------------------------------------------------
-# pause/resume/cancel/stats
+# pause/resume/stop/stats
 # ------------------------------------------------------------
-@router.message(Command("cancel"))
-async def cancel_handler(message: Message):
-    global skip_current_number
-    if is_processing and current_task:
-        task = current_task
-        skip_current_number = True
-        device_event.set()
-        pause_event.set()
-        task.cancel()
-        # wait for the batch to finish unwinding (it releases is_processing itself) so a
-        # Resume tapped right after /cancel can't overlap with the old run
-        await asyncio.wait({task}, timeout=10)
-        await message.answer("Batch cancelled successfully.")
+@router.message(Command("stop"))
+async def stop_handler(message: Message):
+    global stop_requested
+    if not (is_processing and current_task):
+        await message.answer("No active processing session to stop.")
+        return
+    if stop_requested:
+        await message.answer("Already stopping...")
+        return
+
+    task = current_task
+    stop_requested = True       # every wait in the number flow checks this, so the stop can't be swallowed
+    pause_event.set()           # wake a paused batch
+    device_event.set()          # wake waits on the device
+    for waiter in list(live_success_failure_events.values()):
+        waiter.set()            # wake a wait on the chat result
+    task.cancel()
+    # wait for the batch to finish unwinding (it releases is_processing itself) so a
+    # Resume tapped right after /stop can't overlap with the old run
+    _done, pending = await asyncio.wait({task}, timeout=10)
+    if pending:
+        await message.answer("Stop requested. The batch ends as soon as the current step finishes.")
     else:
-        await message.answer("No active processing session to cancel.")
+        await message.answer("Batch stopped successfully.")
 
 
 @router.message(Command("pause"))
