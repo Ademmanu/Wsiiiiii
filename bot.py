@@ -57,7 +57,10 @@ NUMBER_FILE_TTL_HOURS = int(os.getenv("NUMBER_FILE_TTL_HOURS", "48"))
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(5 * 1024 * 1024)))
 FILES_PER_PAGE = 10
 OTP_PICK_PER_PAGE = 10
-PENDING_BATCH_TTL = 1800  # seconds a picked-but-unstarted batch stays valid
+PENDING_BATCH_TTL = 600  # seconds a picked-but-unstarted batch stays valid (10 minutes)
+NO_CODE_AFTER_SECONDS = int(os.getenv("NO_CODE_AFTER_SECONDS", "30"))  # tell the device "no_code" after this long without a code
+DEVICE_STATE_WAIT_SECONDS = 300  # the 5-minute device state wait
+NEXT_NUMBER_DELAY_SECONDS = float(os.getenv("NEXT_NUMBER_DELAY_SECONDS", "2"))  # pause between numbers, however the last one ended
 
 router = Router()
 bot_instance: Optional[Bot] = None
@@ -91,6 +94,7 @@ pause_event.set()
 # SUCCESS / FAILED waiters, keyed by (user_id, number); resolved by the live chat handler
 live_success_failure_events: dict[tuple, asyncio.Event] = {}
 live_success_failure_results: dict[tuple, str] = {}
+live_success_failure_state: dict[tuple, dict] = {}  # per waiter: id of the message we sent + results seen before we knew it
 
 # fordet client / live-handler state
 user_clients: Dict[int, "ClientWrapper"] = {}
@@ -109,77 +113,92 @@ FORMAT_PATTERN = re.compile(r'\d{1,2}[|-]\d{1,2}')
 # ------------------------------------------------------------
 # DB helpers
 # ------------------------------------------------------------
+_SCHEMA_STATEMENTS = [
+    ("number_logs", """
+        CREATE TABLE IF NOT EXISTS number_logs (
+            id SERIAL PRIMARY KEY,
+            phone_number VARCHAR(32) NOT NULL,
+            status VARCHAR(32) NOT NULL,
+            details TEXT,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )"""),
+    ("bot_settings", """
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            user_id BIGINT PRIMARY KEY,
+            chat_id BIGINT
+        )"""),
+    ("users", """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            phone VARCHAR(255),
+            name TEXT,
+            session_data TEXT,
+            is_logged_in BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )"""),
+    ("otp_groups", """
+        CREATE TABLE IF NOT EXISTS otp_groups (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            set_index INTEGER NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            formats JSONB NOT NULL,
+            group_ids JSONB NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE,
+            UNIQUE(user_id, set_index)
+        )"""),
+    ("number_files", """
+        CREATE TABLE IF NOT EXISTS number_files (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            name TEXT NOT NULL,
+            numbers JSONB NOT NULL,
+            total INTEGER NOT NULL,
+            next_index INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+        )"""),
+    ("ix_number_files_user", "CREATE INDEX IF NOT EXISTS ix_number_files_user ON number_files (user_id, created_at)"),
+    # prevents duplicate set names per user (add_otp_set relies on this)
+    ("ux_otp_groups_user_name", "CREATE UNIQUE INDEX IF NOT EXISTS ux_otp_groups_user_name ON otp_groups (user_id, name)"),
+]
+
+
 async def init_db():
     global db_pool
     dsn = DATABASE_URL.replace("postgres://", "postgresql://", 1) if DATABASE_URL.startswith("postgres://") else DATABASE_URL
 
     try:
         db_pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=20)
-        logger.info("Connected to PostgreSQL")
-
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS number_logs (
-                    id SERIAL PRIMARY KEY,
-                    phone_number VARCHAR(32) NOT NULL,
-                    status VARCHAR(32) NOT NULL,
-                    details TEXT,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-
-                CREATE TABLE IF NOT EXISTS bot_settings (
-                    user_id BIGINT PRIMARY KEY,
-                    chat_id BIGINT
-                );
-
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    phone VARCHAR(255),
-                    name TEXT,
-                    session_data TEXT,
-                    is_logged_in BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-
-                CREATE TABLE IF NOT EXISTS otp_groups (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    set_index INTEGER NOT NULL,
-                    name VARCHAR(255) NOT NULL,
-                    formats JSONB NOT NULL,
-                    group_ids JSONB NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE,
-                    UNIQUE(user_id, set_index)
-                );
-
-                CREATE TABLE IF NOT EXISTS number_files (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    name TEXT NOT NULL,
-                    numbers JSONB NOT NULL,
-                    total INTEGER NOT NULL,
-                    next_index INTEGER NOT NULL DEFAULT 0,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    expires_at TIMESTAMP WITH TIME ZONE NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS ix_number_files_user ON number_files (user_id, created_at);
-                """
-            )
-
-            # Prevent duplicate set names per user (add_otp_set relies on this)
-            await conn.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_otp_groups_user_name
-                ON otp_groups (user_id, name)
-                """
-            )
     except Exception:
-        logger.exception("Failed to initialize PostgreSQL")
+        logger.exception("Failed to connect to PostgreSQL (nothing will be saved this run)")
+        return
+    logger.info("Connected to PostgreSQL")
+
+    async with db_pool.acquire() as conn:
+        for name, statement in _SCHEMA_STATEMENTS:
+            try:
+                await conn.execute(statement)
+            except Exception:
+                logger.exception(f"Schema step '{name}' failed; features that need it will not persist")
+
+
+async def _load_target_chats_on_startup():
+    """Every user's saved target chat is read back into memory at boot."""
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT user_id, chat_id FROM bot_settings WHERE chat_id IS NOT NULL")
+    except Exception:
+        logger.exception("Could not load saved target chat ids")
+        return
+    for row in rows:
+        user_target_chat_ids[int(row["user_id"])] = int(row["chat_id"])
+    logger.info(f"Loaded {len(rows)} saved target chat id(s)")
 
 
 async def log_number_status(phone_number: str, status: str, details: str = None):
@@ -1364,7 +1383,9 @@ class AutoOTPSearchManager:
         return self._key_locks[key]
 
     async def start_search(self, user_id: int, search_key: str, extracted_number: str,
-                           task_label: str = "", set_name: Optional[str] = None) -> Optional[asyncio.Future]:
+                           task_label: str = "", set_name: Optional[str] = None,
+                           duration: Optional[float] = None,
+                           exclude_otps: Optional[Set[str]] = None) -> Optional[asyncio.Future]:
         """
         Registers a search and returns a future that resolves to
         (otp, set_name) when found, or None when the search times out / is cancelled.
@@ -1405,11 +1426,11 @@ class AutoOTPSearchManager:
                 'task_label':       task_label,
                 'all_sets':         all_search_patterns,
                 'start_time':       time.time(),
-                'end_time':         time.time() + OTP_SEARCH_DURATION,
+                'end_time':         time.time() + (duration if duration is not None else OTP_SEARCH_DURATION),
+                'exclude':          set(exclude_otps or ()),   # codes already sent for this number
                 'cancelled':        False,
                 'found_otp':        False,
                 'future':           future,
-                'backfill_done':    asyncio.Event(),   # set when the history scan has finished (found or not)
             }
 
         logger.info(
@@ -1423,14 +1444,6 @@ class AutoOTPSearchManager:
         return future
 
     async def _run_backfill(self, search_key: str):
-        info = self.searches.get(search_key)
-        try:
-            await self._run_backfill_inner(search_key)
-        finally:
-            if info and info.get('backfill_done') is not None:
-                info['backfill_done'].set()
-
-    async def _run_backfill_inner(self, search_key: str):
         """
         One-shot iter_messages scan covering the last OTP_BACKFILL_WINDOW_SECONDS.
         Catches OTPs that were already posted before the search started.
@@ -1498,7 +1511,7 @@ class AutoOTPSearchManager:
                         for pattern in patterns:
                             if pattern in msg_text:
                                 otp = OTPFormatParser.extract_otp(extract_full_message(message))
-                                if otp:
+                                if otp and otp.replace('-', '') not in search_info['exclude']:
                                     logger.info(
                                         f"✅ [Backfill] OTP '{otp}' found in group {group_id} "
                                         f"(pattern '{pattern}', set '{set_name}')"
@@ -1559,7 +1572,7 @@ class AutoOTPSearchManager:
                         continue
 
                     otp = OTPFormatParser.extract_otp(extract_full_message(message))
-                    if otp:
+                    if otp and otp.replace('-', '') not in search_info['exclude']:
                         logger.info(
                             f"✅ [Live] OTP '{otp}' found for {search_key} "
                             f"in group {group_id} (pattern '{pattern}', set '{set_info['set_name']}')"
@@ -1671,25 +1684,62 @@ def _clear_result_handlers(user_id: int, client):
             pass
 
 
-def check_result_message(user_id: int, text: str) -> bool:
+def _decide_result(text: str) -> Optional[str]:
+    if "SUCCESS" in text:
+        return "SUCCESS"
+    if "FAILED" in text:
+        return "FAILED"
+    if "BANNED" in text:
+        return "BANNED"
+    return None
+
+
+def check_result_message(user_id: int, text: str, msg_id: Optional[int] = None) -> bool:
     """
-    Pure in-memory SUCCESS/FAILED matching against the numbers currently waiting
-    for a decision. Zero API calls. Returns True if a waiting number was resolved.
+    Pure in-memory SUCCESS / FAILED / BANNED matching against the numbers currently waiting
+    for a decision. Zero API calls. Only messages that arrive AFTER the number was sent count:
+    anything with an id at or below our sent message is ignored (the check never looks back).
+    Returns True if a waiting number was resolved.
     """
-    if not text or ("SUCCESS" not in text and "FAILED" not in text):
+    if not text:
+        return False
+    verdict = _decide_result(text)
+    if verdict is None:
         return False
     hit = False
     for key, ev in list(live_success_failure_events.items()):
         uid, num = key
         if uid != user_id or num not in text:
             continue
-        if "SUCCESS" in text:
-            live_success_failure_results[key] = "SUCCESS"
-        elif "FAILED" in text:
-            live_success_failure_results[key] = "FAILED"
+        state = live_success_failure_state.get(key)
+        if state is not None:
+            if state["sent_id"] is None:
+                # our send hasn't returned yet, so we can't tell where "after" starts: hold it
+                state["buffer"].append((msg_id, text))
+                continue
+            if msg_id is not None and msg_id <= state["sent_id"]:
+                continue
+        live_success_failure_results[key] = verdict
         ev.set()
         hit = True
     return hit
+
+
+def arm_result_waiter(key: tuple, sent_id: Optional[int]) -> None:
+    """The number has been sent: from here on only newer messages count. Replays anything held back."""
+    state = live_success_failure_state.get(key)
+    ev = live_success_failure_events.get(key)
+    if state is None or ev is None:
+        return
+    state["sent_id"] = sent_id if sent_id is not None else 0
+    for msg_id, text in state["buffer"]:
+        if msg_id is None or msg_id > state["sent_id"]:
+            verdict = _decide_result(text)
+            if verdict:
+                live_success_failure_results[key] = verdict
+                ev.set()
+                break
+    state["buffer"].clear()
 
 
 async def update_result_handler_for_user(user_id: int):
@@ -1713,7 +1763,7 @@ async def update_result_handler_for_user(user_id: int):
             message = event.message
             if not message:
                 return
-            check_result_message(user_id, extract_message_text_only(message))
+            check_result_message(user_id, extract_message_text_only(message), getattr(message, 'id', None))
         except Exception as e:
             logger.debug(f"Result live handler error (user {user_id}, chat {chat_id}): {e}")
 
@@ -1752,7 +1802,8 @@ def get_bot():
     return bot_instance
 
 
-async def forward_message_direct(user_id: int, target_id, message_text: str) -> Tuple[bool, str]:
+async def forward_message_direct(user_id: int, target_id, message_text: str,
+                                 sent_info: Optional[dict] = None) -> Tuple[bool, str]:
     """Send message_text to target_id as the logged-in user, with no forward tag.
     Returns (ok, reason)."""
     last_reason = "unknown"
@@ -1788,7 +1839,9 @@ async def forward_message_direct(user_id: int, target_id, message_text: str) -> 
             send_kwargs['reply_to'] = target_topic_id
 
         try:
-            await client.send_message(entity, message_text, **send_kwargs)
+            sent_message = await client.send_message(entity, message_text, **send_kwargs)
+            if sent_info is not None:
+                sent_info['message_id'] = getattr(sent_message, 'id', None)
 
             in_fw, _, should_notify_end = flood_wait_manager.is_in_flood_wait(user_id)
             flood_wait_manager.clear_flood_wait(user_id)
@@ -3183,7 +3236,9 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
 # ------------------------------------------------------------
 # Session restore (fordet restore_single_session, DB path)
 # ------------------------------------------------------------
-async def restore_single_session(user_id: int, session_data: str) -> bool:
+async def _restore_attempt(user_id: int, session_data: str) -> str:
+    """One restore try. Returns 'ok', 'invalid' (Telegram rejected the session), 'skip' or 'retry' (transient)."""
+    client = None
     try:
         client = TelegramClient(StringSession(session_data), API_ID, API_HASH)
         await client.connect()
@@ -3191,7 +3246,7 @@ async def restore_single_session(user_id: int, session_data: str) -> bool:
         if not await client.is_user_authorized():
             await db_call(db.save_user, user_id, None, None, None, False)
             await client.disconnect()
-            return False
+            return "invalid"
 
         if len(user_clients) >= MAX_CONCURRENT_USERS:
             try:
@@ -3200,40 +3255,68 @@ async def restore_single_session(user_id: int, session_data: str) -> bool:
                 pass
             await db_call(db.save_user, user_id, None, None, None, True)
             logger.warning(f"Max users reached, skipping restoration for user {user_id}")
-            return False
+            return "skip"
 
         user_clients[user_id] = ClientWrapper(client)
 
-        try:
-            me = await client.get_me()
-            user_name = me.first_name or "User"
+        me = await client.get_me()
+        user_name = me.first_name or "User"
 
-            user = await db_call(db.get_user, user_id)
+        user = await db_call(db.get_user, user_id)
 
-            await db_call(db.save_user, user_id,
-                          user["phone"] if user else None,
-                          user_name,
-                          session_data,
-                          True)
+        await db_call(db.save_user, user_id,
+                      user["phone"] if user else None,
+                      user_name,
+                      session_data,
+                      True)
 
-            logger.info(f"✅ Restored session for user {user_id} ({user_name}) from database")
+        logger.info(f"✅ Restored session for user {user_id} ({user_name}) from database")
 
-            asyncio.create_task(_preload_user_dialogs(user_id, client, user_name))
-            await start_live_handlers_for_user(user_id)
-
-            return True
-
-        except Exception as e:
-            logger.exception(f"Error in restore_single_session for user {user_id}: {e}")
-            return False
+        asyncio.create_task(_preload_user_dialogs(user_id, client, user_name))
+        await start_live_handlers_for_user(user_id)
+        return "ok"
 
     except Exception as e:
-        logger.exception(f"Failed to restore session for user {user_id}: {e}")
-        try:
-            await db_call(db.save_user, user_id, None, None, None, False)
-        except Exception:
-            pass
-        return False
+        logger.warning(f"Session restore for user {user_id} hit a temporary error: {e}")
+        user_clients.pop(user_id, None)
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        return "retry"
+
+
+async def _restore_retry_loop(user_id: int, session_data: str, tries: int = 30, interval: float = 60.0):
+    for _ in range(tries):
+        await asyncio.sleep(interval)
+        if user_id in user_clients:
+            return
+        if await _restore_attempt(user_id, session_data) != "retry":
+            return
+    logger.warning(f"Giving up restoring user {user_id} in the background; the saved session is kept for the next restart")
+
+
+async def restore_single_session(user_id: int, session_data: str, attempts: int = 3, delay: float = 3.0,
+                                 retry_in_background: bool = True) -> bool:
+    """
+    The saved session is only discarded when Telegram says it is no longer valid. A network hiccup
+    at boot keeps it (retrying now, then in the background) so the user is never logged out by one.
+    """
+    for attempt in range(attempts):
+        result = await _restore_attempt(user_id, session_data)
+        if result == "ok":
+            return True
+        if result in ("invalid", "skip"):
+            return False
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay)
+    logger.warning(f"Could not restore user {user_id} yet; keeping the saved session")
+    if retry_in_background:
+        task = asyncio.create_task(_restore_retry_loop(user_id, session_data))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    return False
 
 
 async def _load_saved_sessions_on_startup():
@@ -3407,9 +3490,13 @@ async def start_handler(message: Message):
         "2) /otpgroups to add OTP sets, e.g. HK = 2|TGT|3 = -100123456789\n"
         "3) Send numbers as text, or send a .txt file, then pick which OTP group to search (or All Groups). Files are saved while you are logged in, so you can resume them\n"
         "4) If the device requests a code, the bot searches your OTP groups (short backfill + live handlers) "
-        "for the number-derived pattern and sends the OTP it finds to the device\n"
-        "5) When the device says continue, your logged-in account sends the plain number (no forward tag) to the "
-        "target chat and a live handler waits for exact case-sensitive SUCCESS/FAILED messages."
+        "for the number-derived pattern and sends the OTP it finds to the device. After 30s without a code the "
+        "device gets no_code and the search keeps going. blocked / try_again end the number at any point.\n"
+        "5) After the code is sent the bot waits for the device (up to 5 minutes): continue starts the chat check, "
+        "error searches for a new code.\n"
+        "6) On continue, your logged-in account sends the plain number (no forward tag) to the target chat and a live "
+        "handler waits for a newer message with the exact, case-sensitive word SUCCESS, FAILED or BANNED, then tells "
+        "the device to clear and moves to the next number."
     )
     await message.answer(help_text)
 
@@ -3441,16 +3528,26 @@ async def otpgroups_cmd_handler(message: Message):
 @router.message(Command("setchatid"))
 async def setchatid_handler(message: Message):
     global target_chat_id
+    user_id = message.from_user.id
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer(f"Current target chat id: `{target_chat_id}`\nUsage: `/setchatid -100xxxxxxxxxx`", parse_mode="Markdown")
+        current = await _get_user_target_chat(user_id)
+        shown = f"`{current}`" if current else "not set"
+        await message.answer(f"Current target chat id: {shown}\nUsage: `/setchatid -100xxxxxxxxxx`", parse_mode="Markdown")
         return
 
     try:
         chat_id = int(args[1])
-        user_target_chat_ids[message.from_user.id] = chat_id
-        target_chat_id = chat_id
-        if db_pool:
+    except ValueError:
+        await message.answer("❌ Invalid Chat ID format. Must be an integer.")
+        return
+
+    user_target_chat_ids[user_id] = chat_id
+    target_chat_id = chat_id
+
+    saved = False
+    if db_pool:
+        try:
             async with db_pool.acquire() as conn:
                 await conn.execute(
                     """
@@ -3459,14 +3556,24 @@ async def setchatid_handler(message: Message):
                     ON CONFLICT (user_id)
                     DO UPDATE SET chat_id = EXCLUDED.chat_id
                     """,
-                    message.from_user.id,
+                    user_id,
                     chat_id,
                 )
-        # the SUCCESS/FAILED live handler follows the target chat
-        await update_result_handler_for_user(message.from_user.id)
+            saved = True
+        except Exception:
+            logger.exception(f"Could not save target chat id for user {user_id}")
+
+    # the SUCCESS/FAILED/BANNED live handler follows the target chat
+    await update_result_handler_for_user(user_id)
+
+    if saved:
         await message.answer(f"✅ Target chat ID successfully set to `{chat_id}`", parse_mode="Markdown")
-    except ValueError:
-        await message.answer("❌ Invalid Chat ID format. Must be an integer.")
+    else:
+        await message.answer(
+            f"⚠️ Target chat ID set to `{chat_id}` for now, but it could not be saved to the database, "
+            "so it will be lost on restart.",
+            parse_mode="Markdown",
+        )
 
 
 # ------------------------------------------------------------
@@ -3798,7 +3905,8 @@ def _scope_label(otp_set_name: Optional[str]) -> str:
 
 
 def _search_interrupt_from_status() -> Optional[str]:
-    """blocked / try_again from the device end the OTP search immediately."""
+    """While searching for a code, blocked / try_again from the device end the number
+    (it can turn out bad or delayed after the code was requested)."""
     status = (device_status or "").lower()
     if "blocked" in status:
         return "blocked"
@@ -3807,9 +3915,180 @@ def _search_interrupt_from_status() -> Optional[str]:
     return None
 
 
+def _device_state_from_status() -> Optional[str]:
+    """What the device answered after we sent it a code."""
+    status = (device_status or "").lower()
+    if "blocked" in status:
+        return "blocked"
+    if "try_again" in status:
+        return "try_again"
+    if "error" in status and "request_code" not in status:
+        return "error"
+    if "continue" in status or "proceed" in status:
+        return "continue"
+    return None
+
+
+async def _wait_device_state(deadline: float) -> str:
+    """Waits (inside the 5-minute device state wait) until the device answers.
+    Returns blocked | try_again | error | continue | skip | timeout. Other callbacks are ignored."""
+    while True:
+        state = _device_state_from_status()
+        if state:
+            return state
+        if skip_current_number:
+            return "skip"
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return "timeout"
+        device_event.clear()
+        try:
+            await asyncio.wait_for(device_event.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _search_for_otp(num_msg, user_id: int, num: str, otp_set_name: Optional[str], duration: float,
+                          exclude: Set[str], hard_deadline: Optional[float] = None) -> Dict:
+    """
+    One OTP search. Keeps going until a code is found, the device says blocked / try_again,
+    /next, /cancel or the time is up. After NO_CODE_AFTER_SECONDS without a code the device is told
+    "no_code" once, and the search keeps running. Any other device callback only re-arms the wait.
+    Returns {"outcome": found | blocked | try_again | skip | none | nopattern, ...}.
+    """
+    global device_status
+    scope_label = _scope_label(otp_set_name)
+    search_key = f"{user_id}:{num}"
+    fut = await otp_search_manager.start_search(
+        user_id, search_key, num, task_label="batch", set_name=otp_set_name,
+        duration=duration, exclude_otps=exclude,
+    )
+    if fut is None:
+        return {"outcome": "nopattern", "scope_label": scope_label}
+
+    started = time.time()
+    deadline = started + duration + 5
+    if hard_deadline is not None:
+        deadline = min(deadline, hard_deadline)
+    no_code_at = started + NO_CODE_AFTER_SECONDS
+    no_code_sent = False
+    interrupt = None
+    device_event.clear()
+    device_status = None
+    try:
+        while True:
+            interrupt = _search_interrupt_from_status()
+            if interrupt or fut.done() or skip_current_number or time.time() >= deadline:
+                break
+
+            if not no_code_sent and time.time() >= no_code_at:
+                no_code_sent = True
+                await num_msg.edit_text(
+                    f"{num} ⚪ No code after {NO_CODE_AFTER_SECONDS}s. Still searching ({scope_label})..."
+                )
+                await call_device_api(num, payload_type="no_code")
+                continue
+
+            device_event.clear()
+            wake_at = deadline if no_code_sent else min(deadline, no_code_at)
+            waiter = asyncio.ensure_future(device_event.wait())
+            try:
+                await asyncio.wait(
+                    {fut, waiter},
+                    timeout=max(0.0, wake_at - time.time()),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                waiter.cancel()
+    finally:
+        await otp_search_manager.cancel_search(search_key)
+
+    if skip_current_number:
+        return {"outcome": "skip"}
+    if interrupt:
+        return {"outcome": interrupt}
+    if fut.done() and not fut.cancelled():
+        found = fut.result()
+        if found:
+            return {"outcome": "found", "code": found[0], "set_name": found[1]}
+    return {"outcome": "none"}
+
+
+async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str]) -> bool:
+    """
+    Device asked for a code: search, send it, then wait for the device's state before deciding anything.
+      continue -> True (go on to the chat check)
+      error    -> search again for a new code, all inside the same 5-minute device state wait
+      blocked / try_again at any point -> the number ends here (Bad / Try Later)
+    Returns False when the number is finished.
+    """
+    global device_status
+    scope_label = _scope_label(otp_set_name)
+    await num_msg.edit_text(f"{num} ⚪ Device requested code. Searching OTP groups ({scope_label})...")
+
+    sent_codes: Set[str] = set()
+    state_deadline: Optional[float] = None   # starts when the first code is sent
+    duration = OTP_SEARCH_DURATION
+
+    async def finish(text: str, status: str) -> bool:
+        await num_msg.edit_text(f"{num} {text}")
+        await log_number_status(num, status)
+        return False
+
+    while True:
+        res = await _search_for_otp(num_msg, user_id, num, otp_set_name, duration, sent_codes, state_deadline)
+        outcome = res["outcome"]
+
+        if outcome == "skip":
+            return await finish("⏭️ Skipped", "skipped")
+        if outcome == "blocked":
+            return await finish("⚫ Bad", "blocked")
+        if outcome == "try_again":
+            return await finish("🟡 Try Later", "try_again")
+        if outcome == "nopattern":
+            return await finish(
+                f"🔴 No OTP available. Skipping.\n(no usable OTP search pattern for this number in {scope_label}; check /otpgroups)",
+                "no_otp_found")
+        if outcome == "none":
+            if sent_codes:
+                return await finish("🔴 No new OTP found after the device error. Skipping.", "no_otp_found")
+            return await finish("🔴 No OTP available. Skipping.", "no_otp_found")
+
+        code, set_name = res["code"], res["set_name"]
+        sent_codes.add(code)
+        await num_msg.edit_text(
+            f"{num} ⚪ OTP found (set {html.escape(set_name)}): <code>{code}</code>", parse_mode="HTML"
+        )
+
+        device_event.clear()
+        device_status = None
+        await call_device_api(num, payload_type="send_code", code=code)
+        if state_deadline is None:
+            state_deadline = time.time() + DEVICE_STATE_WAIT_SECONDS
+
+        state = await _wait_device_state(state_deadline)
+        if state == "continue":
+            return True
+        if state == "skip":
+            return await finish("⏭️ Skipped", "skipped")
+        if state == "blocked":
+            return await finish("⚫ Bad", "blocked")
+        if state == "try_again":
+            return await finish("🟡 Try Later", "try_again")
+        if state == "timeout":
+            return await finish("🟠 Ended (Device timeout after sending code - 5 mins)", "device_timeout_after_code")
+
+        # state == "error": look for a new code, still inside the same device state wait
+        remaining = state_deadline - time.time()
+        if remaining <= 0:
+            return await finish("🟠 Ended (Device timeout after sending code - 5 mins)", "device_timeout_after_code")
+        await num_msg.edit_text(f"{num} 🔁 Device reported an error. Rechecking OTP ({scope_label})...")
+        duration = min(OTP_SEARCH_DURATION, remaining)
+
+
 async def process_number(message: Message, user_id: int, target_chat: Optional[int], num: str,
                          otp_set_name: Optional[str] = None) -> None:
-    """Runs one number through device check -> OTP search -> send code -> no-tag forward -> SUCCESS/FAILED."""
+    """Runs one number through device check -> OTP search/send -> no-tag forward -> SUCCESS/FAILED/BANNED -> clear."""
     global device_status
     num_msg = await message.answer(f"{num} ⏳ Checking on device...")
 
@@ -3823,7 +4102,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
         return
 
     try:
-        await asyncio.wait_for(device_event.wait(), timeout=300)
+        await asyncio.wait_for(device_event.wait(), timeout=DEVICE_STATE_WAIT_SECONDS)
     except asyncio.TimeoutError:
         if skip_current_number:
             await num_msg.edit_text(f"{num} ⏭️ Skipped")
@@ -3848,7 +4127,6 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
     if "try_again" in result_text:
         await num_msg.edit_text(f"{num} 🟡 Try Later")
         await log_number_status(num, "try_again")
-        await asyncio.sleep(5)
         return
 
     if "error" in result_text and "request_code" not in result_text:
@@ -3857,145 +4135,50 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
         return
 
     if "request_code" in result_text or "requestcode" in result_text or "request-code" in result_text:
-        scope_label = _scope_label(otp_set_name)
-        await num_msg.edit_text(f"{num} ⚪ Device requested code. Searching OTP groups ({scope_label})...")
-
-        # fordet auto-OTP search: backfill + live handlers, resolves when the OTP shows up
-        search_key = f"{user_id}:{num}"
-        fut = await otp_search_manager.start_search(user_id, search_key, num, task_label="batch", set_name=otp_set_name)
-        code = None
-        set_name = None
-        interrupt = None
-
-        if fut is None:
-            await num_msg.edit_text(
-                f"{num} ⚠️ No usable OTP search pattern for this number ({scope_label}). Check your formats in /otpgroups."
-            )
-        else:
-            backfill_done = (otp_search_manager.searches.get(search_key) or {}).get('backfill_done')
-            deadline = time.time() + OTP_SEARCH_DURATION + 5
-            no_code_sent = False
-            device_event.clear()
-            device_status = None
-            try:
-                # keeps searching until: OTP found, device says blocked/try_again, /next, /cancel or timeout.
-                # Any other device callback only re-arms the wait.
-                while True:
-                    interrupt = _search_interrupt_from_status()
-                    if interrupt or fut.done() or skip_current_number or time.time() >= deadline:
-                        break
-
-                    # history scan came back empty: tell the device once ("no_code"), but keep searching
-                    if backfill_done is not None and backfill_done.is_set() and not no_code_sent:
-                        no_code_sent = True
-                        await num_msg.edit_text(f"{num} ⚪ No code yet. Still searching ({scope_label})...")
-                        await call_device_api(num, payload_type="no_code")
-                        continue
-
-                    device_event.clear()
-                    helpers = [asyncio.ensure_future(device_event.wait())]
-                    if backfill_done is not None and not no_code_sent:
-                        helpers.append(asyncio.ensure_future(backfill_done.wait()))
-                    try:
-                        await asyncio.wait(
-                            {fut, *helpers},
-                            timeout=max(0.0, deadline - time.time()),
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                    finally:
-                        for helper in helpers:
-                            helper.cancel()
-            finally:
-                await otp_search_manager.cancel_search(search_key)
-
-            if skip_current_number:
-                await num_msg.edit_text(f"{num} ⏭️ Skipped")
-                await log_number_status(num, "skipped")
-                return
-
-            if interrupt == "blocked":
-                await num_msg.edit_text(f"{num} ⚫ Bad")
-                await log_number_status(num, "blocked")
-                return
-
-            if interrupt == "try_again":
-                await num_msg.edit_text(f"{num} 🟡 Try Later")
-                await log_number_status(num, "try_again")
-                await asyncio.sleep(5)
-                return
-
-            if fut.done() and not fut.cancelled():
-                found = fut.result()
-                if found:
-                    code, set_name = found
-
-            if code:
-                await num_msg.edit_text(
-                    f"{num} ⚪ OTP found (set {html.escape(set_name)}): <code>{code}</code>", parse_mode="HTML"
-                )
-            else:
-                await num_msg.edit_text(
-                    f"{num} ⚠️ Could not find OTP in your OTP groups. Please ensure your logged-in account is a member and can read them."
-                )
-
-        if not code:
-            await num_msg.edit_text(f"{num} 🔴 No OTP available. Skipping.")
-            await log_number_status(num, "no_otp_found")
+        if not await _otp_stage(num_msg, user_id, num, otp_set_name):
+            return
+    else:
+        result_after = (device_status or "").lower()
+        if "continue" not in result_after and "continued" not in result_after and "proceed" not in result_after:
+            await num_msg.edit_text(f"{num} ⚠️ Device did not signal to continue. Status: `{device_status}`", parse_mode="Markdown")
+            await log_number_status(num, "no_continue")
             return
 
-        device_event.clear()
-        device_status = None
-        await call_device_api(num, payload_type="send_code", code=code)
+    await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting SUCCESS/FAILED/BANNED...")
 
-        try:
-            await asyncio.wait_for(device_event.wait(), timeout=300)
-            if skip_current_number:
-                await num_msg.edit_text(f"{num} ⏭️ Skipped")
-                await log_number_status(num, "skipped")
-                return
-        except asyncio.TimeoutError:
-            if skip_current_number:
-                await num_msg.edit_text(f"{num} ⏭️ Skipped")
-                await log_number_status(num, "skipped")
-                return
-            await num_msg.edit_text(f"{num} 🟠 Ended (Device timeout after sending code - 5 mins)")
-            await log_number_status(num, "device_timeout_after_code")
-            return
-
-    result_after = (device_status or "").lower()
-    if "continue" not in result_after and "continued" not in result_after and "proceed" not in result_after:
-        await num_msg.edit_text(f"{num} ⚠️ Device did not signal to continue. Status: `{device_status}`", parse_mode="Markdown")
-        await log_number_status(num, "no_continue")
+    if not target_chat:
+        await num_msg.edit_text(f"{num} ⚠️ Target chat ID not set! Use /setchatid.")
         return
 
-    await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting SUCCESS/FAILED...")
+    key = (user_id, num)
+    ev = asyncio.Event()
+    # register the waiter BEFORE sending; results are only accepted from messages newer than the one we send
+    live_success_failure_events[key] = ev
+    live_success_failure_results.pop(key, None)
+    live_success_failure_state[key] = {"sent_id": None, "buffer": []}
+    try:
+        sent_info: dict = {}
+        ok, reason = await forward_message_direct(user_id, target_chat, num, sent_info)
+        if not ok:
+            logger.error("Failed to forward to target chat %s (%s)", target_chat, reason)
+            await num_msg.edit_text(f"{num} ❌ Error forwarding to target chat ID.")
+            return
+        arm_result_waiter(key, sent_info.get("message_id"))
 
-    if target_chat:
-        key = (user_id, num)
-        ev = asyncio.Event()
-        # register the waiter BEFORE sending so a fast SUCCESS/FAILED can't be missed
-        live_success_failure_events[key] = ev
-        live_success_failure_results.pop(key, None)
         try:
-            ok, reason = await forward_message_direct(user_id, target_chat, num)
-            if not ok:
-                logger.error("Failed to forward to target chat %s (%s)", target_chat, reason)
-                await num_msg.edit_text(f"{num} ❌ Error forwarding to target chat ID.")
-                return
-
-            try:
-                await asyncio.wait_for(ev.wait(), timeout=300)
-                decision = live_success_failure_results.get(key, "UNKNOWN")
-                await num_msg.edit_text(f"{num} 🏁 Result Decided: {decision}")
-                await log_number_status(num, decision.lower())
-            except asyncio.TimeoutError:
-                await num_msg.edit_text(f"{num} 🟠 Live decision timeout (No SUCCESS/FAILED received)")
-                await log_number_status(num, "decision_timeout")
-        finally:
-            live_success_failure_events.pop(key, None)
-            live_success_failure_results.pop(key, None)
-    else:
-        await num_msg.edit_text(f"{num} ⚠️ Target chat ID not set! Use /setchatid.")
+            await asyncio.wait_for(ev.wait(), timeout=DEVICE_STATE_WAIT_SECONDS)
+            decision = live_success_failure_results.get(key, "UNKNOWN")
+            await num_msg.edit_text(f"{num} 🏁 Result Decided: {decision}")
+            await log_number_status(num, decision.lower())
+            # SUCCESS, FAILED or BANNED: tell the device to clear, then on to the next number
+            await call_device_api(num, payload_type="clear")
+        except asyncio.TimeoutError:
+            await num_msg.edit_text(f"{num} 🟠 Live decision timeout (No SUCCESS/FAILED/BANNED received)")
+            await log_number_status(num, "decision_timeout")
+    finally:
+        live_success_failure_events.pop(key, None)
+        live_success_failure_results.pop(key, None)
+        live_success_failure_state.pop(key, None)
 
 
 async def run_batch(message: Message, user_id: int, numbers: List[str],
@@ -4059,6 +4242,10 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             completed = idx + 1
             if file_id is not None:
                 await db_set_file_progress(file_id, completed)
+
+            # same short pause after every number, however it ended
+            if idx < total - 1 and NEXT_NUMBER_DELAY_SECONDS > 0:
+                await asyncio.sleep(NEXT_NUMBER_DELAY_SECONDS)
 
         done_text = f"Batch completed.\nProcessed: {total}/{total}"
         if file_name:
@@ -4133,14 +4320,6 @@ async def build_otp_picker_view(user_id: int, page: int, header: Optional[str] =
     lines += ["Choose which OTP set to search for codes, or <b>All Groups</b> to search every set.", ""]
 
     keyboard = []
-    if pages > 1:
-        nav = []
-        if page > 0:
-            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"otpsel_page_{page - 1}"))
-        nav.append(InlineKeyboardButton(f"📄 {page + 1}/{pages}", callback_data="otpsel_noop"))
-        if page < pages - 1:
-            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"otpsel_page_{page + 1}"))
-        keyboard.append(nav)
     keyboard.append([InlineKeyboardButton("🌐 All Groups", callback_data="otpsel_all")])
 
     row = []
@@ -4156,6 +4335,14 @@ async def build_otp_picker_view(user_id: int, page: int, header: Optional[str] =
             row = []
     if row:
         keyboard.append(row)
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"otpsel_page_{page - 1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page + 1}/{pages}", callback_data="otpsel_noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"otpsel_page_{page + 1}"))
+        keyboard.append(nav)
     keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="otpsel_cancel")])
     return "\n".join(lines), InlineKeyboardMarkup(keyboard)
 
@@ -4638,6 +4825,7 @@ async def start_web_server():
 async def main():
     global bot_instance
     await init_db()
+    await _load_target_chats_on_startup()
 
     bot = Bot(token=BOT_TOKEN)
     bot_instance = bot
