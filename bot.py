@@ -61,8 +61,16 @@ PENDING_BATCH_TTL = 600  # seconds a picked-but-unstarted batch stays valid (10 
 NO_CODE_AFTER_SECONDS = int(os.getenv("NO_CODE_AFTER_SECONDS", "40"))  # tell the device "no_code" after this long without a code
 DEVICE_STATE_WAIT_SECONDS = 300  # ONE shared budget for all waiting on the device, counted from the check
 RESULT_WAIT_SECONDS = int(os.getenv("RESULT_WAIT_SECONDS", "180"))  # separate wait for the chat result (3 minutes)
-# words the chat can answer with (case-sensitive, "contains"); the first one found in a message wins
+# words the chat can answer with: any capitalisation, "contains"; the first one found in a message wins.
+# SUCCESS also covers successful / successfully; "unsuccessful", "unbanned" and "unblocked" are not matches.
 RESULT_KEYWORDS = ("SUCCESS", "FAILED", "BANNED", "BLOCKED", "ERROR")
+RESULT_PATTERNS = (
+    ("SUCCESS", re.compile(r"(?<!un)success", re.IGNORECASE)),
+    ("FAILED", re.compile(r"failed", re.IGNORECASE)),
+    ("BANNED", re.compile(r"(?<!un)banned", re.IGNORECASE)),
+    ("BLOCKED", re.compile(r"(?<!un)blocked", re.IGNORECASE)),
+    ("ERROR", re.compile(r"error", re.IGNORECASE)),
+)
 NEXT_NUMBER_DELAY_SECONDS = float(os.getenv("NEXT_NUMBER_DELAY_SECONDS", "3"))  # pause between numbers, however the last one ended
 
 router = Router()
@@ -99,6 +107,7 @@ pause_event.set()
 live_success_failure_events: dict[tuple, asyncio.Event] = {}
 live_success_failure_results: dict[tuple, str] = {}
 recent_chat_messages: Dict[int, OrderedDict] = {}  # last messages seen in the target chat, only to explain a timeout
+live_wscode_state: dict[tuple, dict] = {}  # per number waiting for a chat result: codes from the device + what to reply to
 live_success_failure_state: dict[tuple, dict] = {}  # per waiter: id of the message we sent + results seen before we knew it
 
 # fordet client / live-handler state
@@ -1690,8 +1699,8 @@ def _clear_result_handlers(user_id: int, client):
 
 
 def _decide_result(text: str) -> Optional[str]:
-    for word in RESULT_KEYWORDS:
-        if word in text:
+    for word, pattern in RESULT_PATTERNS:
+        if pattern.search(text):
             return word
     return None
 
@@ -1792,6 +1801,87 @@ def arm_result_waiter(key: tuple, sent_id: Optional[int], sent_date=None) -> Non
     state["buffer"].clear()
 
 
+def note_incoming_message(user_id: int, msg_id: Optional[int]) -> None:
+    """
+    A message the chat sent US (never an edit, never one of ours). The latest one that arrived after we
+    sent the number is what a code from the device is replied to.
+    """
+    if msg_id is None:
+        return
+    for key, st in live_wscode_state.items():
+        if key[0] != user_id:
+            continue
+        sent_id = live_success_failure_state.get(key, {}).get("sent_id")
+        if sent_id is None:
+            st["held_incoming"].append(msg_id)          # our send hasn't returned yet: judge it once it has
+        elif msg_id > sent_id:
+            if st["reply_to"] is None or msg_id > st["reply_to"]:
+                st["reply_to"] = msg_id
+            st["wake"].set()
+
+
+def arm_wscode(key: tuple, sent_id: Optional[int]) -> None:
+    """The number has been sent: only chat messages newer than it can be replied to."""
+    st = live_wscode_state.get(key)
+    if st is None:
+        return
+    for msg_id in st["held_incoming"]:
+        if msg_id > (sent_id or 0) and (st["reply_to"] is None or msg_id > st["reply_to"]):
+            st["reply_to"] = msg_id
+    st["held_incoming"].clear()
+    if st["reply_to"] is not None:
+        st["wake"].set()
+
+
+def receive_wscode(code: str) -> bool:
+    """A code came back from the device: queue it for the number that is waiting for a chat result."""
+    code = (code or "").strip()
+    if not code or not live_wscode_state:
+        return False
+    key = next(reversed(live_wscode_state))
+    st = live_wscode_state[key]
+    st["codes"].append(code)
+    st["received"] += 1
+    st["wake"].set()
+    logger.info(f"[wscode] code received from the device for {key[1]}")
+    return True
+
+
+async def _flush_wscodes(user_id: int, target_chat, key: tuple) -> None:
+    """Replies every queued code to the chat's latest message (if the chat has sent one since our number)."""
+    st = live_wscode_state.get(key)
+    while st and st["codes"] and st["reply_to"] is not None:
+        _raise_if_stopped()
+        code = st["codes"].pop(0)
+        ok, reason = await forward_message_direct(user_id, target_chat, code, reply_to=st["reply_to"])
+        if ok:
+            st["replied"] += 1
+            logger.info(f"[wscode] code for {key[1]} sent as a reply to message {st['reply_to']}")
+        else:
+            logger.warning(f"[wscode] could not send the code for {key[1]} ({reason})")
+
+
+def _wscode_summary(key: tuple) -> str:
+    """Explains a chat timeout from the wscode side."""
+    st = live_wscode_state.get(key)
+    if not st or not st["received"]:
+        return "\nwscode: no code came back from the device."
+    pending = st["received"] - st["replied"]
+    if not pending:
+        return f"\nwscode: {st['replied']} code(s) sent as a reply."
+    return f"\nwscode: {st['replied']} sent, {pending} not sent (the chat sent no message to reply to)."
+
+
+async def _wait_any(events_: List[asyncio.Event], timeout: float) -> None:
+    """Waits until any of the events is set (or the timeout passes). Never swallows a /stop."""
+    waiters = [asyncio.ensure_future(e.wait()) for e in events_]
+    try:
+        await asyncio.wait(waiters, timeout=max(0.0, timeout), return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for w in waiters:
+            w.cancel()
+
+
 async def update_result_handler_for_user(user_id: int):
     """
     Register the permanent NewMessage handler on the user's target chat that
@@ -1818,6 +1908,9 @@ async def update_result_handler_for_user(user_id: int):
                 logger.info(f"[chat] user {user_id} chat {chat_id} message {getattr(message, 'id', None)}: {text[:80]!r}")
             check_result_message(user_id, text, getattr(message, "id", None), getattr(message, "reply_to_msg_id", None),
                                  getattr(message, "edit_date", None))
+            is_edit = getattr(message, "edit_date", None) is not None or "Edited" in type(event).__qualname__
+            if not is_edit and not getattr(message, "out", False):
+                note_incoming_message(user_id, getattr(message, "id", None))
         except Exception as e:
             logger.warning(f"Result live handler error (user {user_id}, chat {chat_id}): {e}")
 
@@ -1859,7 +1952,7 @@ def get_bot():
 
 
 async def forward_message_direct(user_id: int, target_id, message_text: str,
-                                 sent_info: Optional[dict] = None) -> Tuple[bool, str]:
+                                 sent_info: Optional[dict] = None, reply_to: Optional[int] = None) -> Tuple[bool, str]:
     """Send message_text to target_id as the logged-in user, with no forward tag.
     Returns (ok, reason)."""
     last_reason = "unknown"
@@ -1893,6 +1986,8 @@ async def forward_message_direct(user_id: int, target_id, message_text: str,
         send_kwargs = {}
         if target_topic_id is not None:
             send_kwargs['reply_to'] = target_topic_id
+        if reply_to is not None:
+            send_kwargs['reply_to'] = reply_to      # a reply to that exact message (also inside a topic)
 
         try:
             sent_message = await client.send_message(entity, message_text, **send_kwargs)
@@ -3551,9 +3646,12 @@ async def start_handler(message: Message):
         "device gets no_code and the search keeps going. blocked / try_again end the number at any point.\n"
         f"5) All waiting on the device shares one {DEVICE_STATE_WAIT_SECONDS // 60}-minute budget counted from the check. "
         "After the code is sent: continue starts the chat check, error searches for a new code.\n"
-        "6) On continue, your logged-in account sends the plain number (no forward tag) to the target chat and waits up to "
-        f"{RESULT_WAIT_SECONDS // 60} minutes for a newer (or newly edited) message containing the exact, case-sensitive word "
-        f"{', '.join(RESULT_KEYWORDS)}. SUCCESS shows 🟢 Success, anything else 🟠 Failure.\n"
+        "6) On continue, your logged-in account sends the plain number (no forward tag) to the target chat, then tells the "
+        "device type=wscode. A code the device sends back to /device_callback?wscode=... is sent as a reply to the latest "
+        "message the chat sent you, while the bot waits up to "
+        f"{RESULT_WAIT_SECONDS // 60} minutes for a newer (or newly edited) message containing "
+        f"{', '.join(RESULT_KEYWORDS)} (any capitalisation; successful / successfully count as SUCCESS). "
+        "SUCCESS shows 🟢 Success, anything else 🟠 Failure. If no code comes back the bot just waits.\n"
         "7) When a number ends on a timeout, or a result shows up in the chat, the device is told to clear before the "
         "next number starts. Bad / Try Later / error / skipped are not cleared, and no_code is not an ending."
     )
@@ -4258,6 +4356,8 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
     live_success_failure_events[key] = ev
     live_success_failure_results.pop(key, None)
     live_success_failure_state[key] = {"sent_id": None, "buffer": []}
+    live_wscode_state[key] = {"codes": [], "wake": asyncio.Event(), "reply_to": None, "held_incoming": [],
+                              "received": 0, "replied": 0}
     try:
         sent_info: dict = {}
         _raise_if_stopped()
@@ -4268,9 +4368,29 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
             return
         sent_id = sent_info.get("message_id")
         arm_result_waiter(key, sent_id, sent_info.get("sent_date"))
+        arm_wscode(key, sent_id)
+
+        result_deadline = time.time() + RESULT_WAIT_SECONDS
+
+        # the number is in the chat: ask the device for its code (wscode). If it sends one back it is replied to
+        # the chat's latest message while we keep waiting; if it never does, we simply follow the wait time.
+        await call_device_api(num, payload_type="wscode")
 
         # live handler only (new AND edited messages), like fordet: the chat is never polled
-        got_result = await _wait_event(ev, RESULT_WAIT_SECONDS)
+        got_result = False
+        while True:
+            _raise_if_stopped()
+            if ev.is_set():
+                got_result = True
+                break
+            if result_deadline - time.time() <= 0:
+                break
+            await _flush_wscodes(user_id, target_chat, key)
+            if ev.is_set():
+                got_result = True
+                break
+            await _wait_any([ev, live_wscode_state[key]["wake"]], result_deadline - time.time())
+            live_wscode_state[key]["wake"].clear()
         _raise_if_stopped()
 
         if got_result:
@@ -4284,7 +4404,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
 
         await num_msg.edit_text(
             f"{num} 🟠 Live decision timeout (No {'/'.join(RESULT_KEYWORDS)} received)"
-            f"{_chat_seen_summary(user_id, sent_id)}"
+            f"{_chat_seen_summary(user_id, sent_id)}{_wscode_summary(key)}"
         )
         await log_number_status(num, "decision_timeout")
         return "timeout"
@@ -4292,6 +4412,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
         live_success_failure_events.pop(key, None)
         live_success_failure_results.pop(key, None)
         live_success_failure_state.pop(key, None)
+        live_wscode_state.pop(key, None)
 
 
 async def run_batch(message: Message, user_id: int, numbers: List[str],
@@ -4934,8 +5055,19 @@ async def handle_health_check(request):
 async def handle_device_callback(request):
     global device_status, device_event
     status = request.query.get("status", "unknown")
-    logger.info("Received device callback -> %s", status)
 
+    # the code the device saved in its `wscode` variable:  /device_callback?wscode=123456
+    # (or  /device_callback?status=wscode&code=123456 )
+    code = request.query.get("wscode")
+    if code is None and status.lower() == "wscode":
+        code = request.query.get("code") or request.query.get("value") or ""
+    if code is not None:
+        accepted = receive_wscode(code)
+        logger.info("Received wscode from the device -> %s", "queued" if accepted else "ignored")
+        # a wscode never touches device_status / device_event, so it can't be mistaken for a status answer
+        return web.Response(text="wscode received" if accepted else "wscode ignored (no number is waiting for a code)")
+
+    logger.info("Received device callback -> %s", status)
     device_status = status
     device_event.set()
     return web.Response(text="Callback received successfully")
