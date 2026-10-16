@@ -59,7 +59,10 @@ FILES_PER_PAGE = 10
 OTP_PICK_PER_PAGE = 10
 PENDING_BATCH_TTL = 600  # seconds a picked-but-unstarted batch stays valid (10 minutes)
 NO_CODE_AFTER_SECONDS = int(os.getenv("NO_CODE_AFTER_SECONDS", "40"))  # tell the device "no_code" after this long without a code
-DEVICE_STATE_WAIT_SECONDS = 300  # the 5-minute device state wait
+DEVICE_STATE_WAIT_SECONDS = 300  # ONE shared budget for all waiting on the device, counted from the check
+RESULT_WAIT_SECONDS = int(os.getenv("RESULT_WAIT_SECONDS", "180"))  # separate wait for the chat result (3 minutes)
+# words the chat can answer with (case-sensitive, "contains"); the first one found in a message wins
+RESULT_KEYWORDS = ("SUCCESS", "FAILED", "BANNED", "BLOCKED", "ERROR")
 NEXT_NUMBER_DELAY_SECONDS = float(os.getenv("NEXT_NUMBER_DELAY_SECONDS", "3"))  # pause between numbers, however the last one ended
 
 router = Router()
@@ -95,6 +98,7 @@ pause_event.set()
 # SUCCESS / FAILED waiters, keyed by (user_id, number); resolved by the live chat handler
 live_success_failure_events: dict[tuple, asyncio.Event] = {}
 live_success_failure_results: dict[tuple, str] = {}
+recent_chat_messages: Dict[int, OrderedDict] = {}  # last messages seen in the target chat, only to explain a timeout
 live_success_failure_state: dict[tuple, dict] = {}  # per waiter: id of the message we sent + results seen before we knew it
 
 # fordet client / live-handler state
@@ -1686,60 +1690,105 @@ def _clear_result_handlers(user_id: int, client):
 
 
 def _decide_result(text: str) -> Optional[str]:
-    if "SUCCESS" in text:
-        return "SUCCESS"
-    if "FAILED" in text:
-        return "FAILED"
-    if "BANNED" in text:
-        return "BANNED"
+    for word in RESULT_KEYWORDS:
+        if word in text:
+            return word
     return None
 
 
-def check_result_message(user_id: int, text: str, msg_id: Optional[int] = None) -> bool:
+def _digits(value: str) -> str:
+    return re.sub(r"\D", "", value or "")
+
+
+def _mentions_number(num: str, text: str) -> bool:
+    """The message names our number: literally, or with other spacing / separators / a leading +."""
+    if num in text:
+        return True
+    wanted = _digits(num)
+    return len(wanted) >= 6 and wanted in _digits(text)
+
+
+def _is_after_send(sent_id: int, sent_date, msg_id: Optional[int], edit_date) -> bool:
     """
-    Pure in-memory SUCCESS / FAILED / BANNED matching against the numbers currently waiting
-    for a decision. Zero API calls. Only messages that arrive AFTER the number was sent count:
-    anything with an id at or below our sent message is ignored (the check never looks back).
-    Returns True if a waiting number was resolved.
+    A newer message counts. An OLDER message (a bot that keeps editing one status message) only counts if it
+    was edited after we sent the number: its id stays the same, so the edit time is what says "after".
+    """
+    if msg_id is None or msg_id > sent_id:
+        return True
+    return bool(edit_date and sent_date and edit_date >= sent_date)
+
+
+def _matches_waiter(num: str, text: str, reply_to_id: Optional[int], sent_id: Optional[int]) -> bool:
+    """A result belongs to our number if it names the number or is a direct reply to the message we sent."""
+    return _mentions_number(num, text) or bool(sent_id and reply_to_id and reply_to_id == sent_id)
+
+
+def note_chat_message(user_id: int, msg_id: Optional[int], text: str) -> None:
+    """Remembers the last messages seen in the target chat, only so a timeout can say what was (not) seen."""
+    if msg_id is None:
+        return
+    seen = recent_chat_messages.setdefault(user_id, OrderedDict())
+    seen[msg_id] = text
+    while len(seen) > 40:
+        seen.popitem(last=False)
+
+
+def check_result_message(user_id: int, text: str, msg_id: Optional[int] = None,
+                         reply_to_id: Optional[int] = None, edit_date=None) -> bool:
+    """
+    Pure in-memory matching of a chat message against the numbers waiting for a result. Zero API calls.
+    Only messages that arrive AFTER the number was sent count: anything with an id at or below our sent
+    message is ignored (the check never looks back). Returns True if a waiting number was resolved.
     """
     if not text:
         return False
+    note_chat_message(user_id, msg_id, text)
     verdict = _decide_result(text)
     if verdict is None:
         return False
     hit = False
     for key, ev in list(live_success_failure_events.items()):
         uid, num = key
-        if uid != user_id or num not in text:
+        if uid != user_id:
             continue
         state = live_success_failure_state.get(key)
-        if state is not None:
+        if state is None:
+            if not _mentions_number(num, text):      # waiter without id tracking: the number alone decides
+                continue
+        else:
             if state["sent_id"] is None:
                 # our send hasn't returned yet, so we can't tell where "after" starts: hold it
-                state["buffer"].append((msg_id, text))
+                state["buffer"].append((msg_id, text, reply_to_id, edit_date))
                 continue
-            if msg_id is not None and msg_id <= state["sent_id"]:
+            if not _is_after_send(state["sent_id"], state.get("sent_date"), msg_id, edit_date):
+                continue
+            if not _matches_waiter(num, text, reply_to_id, state["sent_id"]):
                 continue
         live_success_failure_results[key] = verdict
         ev.set()
         hit = True
+        logger.info(f"[chat] {num}: {verdict} (message {msg_id})")
     return hit
 
 
-def arm_result_waiter(key: tuple, sent_id: Optional[int]) -> None:
+def arm_result_waiter(key: tuple, sent_id: Optional[int], sent_date=None) -> None:
     """The number has been sent: from here on only newer messages count. Replays anything held back."""
     state = live_success_failure_state.get(key)
     ev = live_success_failure_events.get(key)
     if state is None or ev is None:
         return
     state["sent_id"] = sent_id if sent_id is not None else 0
-    for msg_id, text in state["buffer"]:
-        if msg_id is None or msg_id > state["sent_id"]:
-            verdict = _decide_result(text)
-            if verdict:
-                live_success_failure_results[key] = verdict
-                ev.set()
-                break
+    state["sent_date"] = sent_date
+    for msg_id, text, reply_to_id, edit_date in state["buffer"]:
+        if not _is_after_send(state["sent_id"], sent_date, msg_id, edit_date):
+            continue
+        if not _matches_waiter(key[1], text, reply_to_id, state["sent_id"]):
+            continue
+        verdict = _decide_result(text)
+        if verdict:
+            live_success_failure_results[key] = verdict
+            ev.set()
+            break
     state["buffer"].clear()
 
 
@@ -1764,17 +1813,23 @@ async def update_result_handler_for_user(user_id: int):
             message = event.message
             if not message:
                 return
-            check_result_message(user_id, extract_message_text_only(message), getattr(message, 'id', None))
+            text = extract_message_text_only(message)
+            if any(uid == user_id for uid, _ in live_success_failure_events):
+                logger.info(f"[chat] user {user_id} chat {chat_id} message {getattr(message, 'id', None)}: {text[:80]!r}")
+            check_result_message(user_id, text, getattr(message, "id", None), getattr(message, "reply_to_msg_id", None),
+                                 getattr(message, "edit_date", None))
         except Exception as e:
-            logger.debug(f"Result live handler error (user {user_id}, chat {chat_id}): {e}")
+            logger.warning(f"Result live handler error (user {user_id}, chat {chat_id}): {e}")
 
     try:
+        # new messages AND edits (many bots post "processing..." and then edit it into the result)
         client.add_event_handler(_result_live_handler, events.NewMessage(chats=chat_id))
+        client.add_event_handler(_result_live_handler, events.MessageEdited(chats=chat_id))
         result_live_handler_registered.setdefault(user_id, []).append(_result_live_handler)
         result_live_handler_chat[user_id] = chat_id
-        logger.info(f"✅ SUCCESS/FAILED live handler registered for user {user_id} on chat {chat_id}")
+        logger.info(f"✅ Chat result live handler registered for user {user_id} on chat {chat_id}")
     except Exception as e:
-        logger.warning(f"Failed to register SUCCESS/FAILED live handler for chat {chat_id}: {e}")
+        logger.warning(f"Failed to register chat result live handler for chat {chat_id}: {e}")
 
 
 async def start_live_handlers_for_user(user_id: int):
@@ -1843,6 +1898,7 @@ async def forward_message_direct(user_id: int, target_id, message_text: str,
             sent_message = await client.send_message(entity, message_text, **send_kwargs)
             if sent_info is not None:
                 sent_info['message_id'] = getattr(sent_message, 'id', None)
+                sent_info['sent_date'] = getattr(sent_message, 'date', None)
 
             in_fw, _, should_notify_end = flood_wait_manager.is_in_flood_wait(user_id)
             flood_wait_manager.clear_flood_wait(user_id)
@@ -3384,7 +3440,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
   /otpgroups - Configure OTP search groups
 
 🎯 **Target Chat:**
-  /setchatid - Set the SUCCESS/FAILED chat
+  /setchatid - Set the result chat
 
 📂 **Number Files:**
   /numberfiles - Saved .txt batches (kept 48h)
@@ -3481,7 +3537,7 @@ async def start_handler(message: Message):
         "Commands:\n"
         "/login - connect your Telegram account (phone -> code -> 2FA)\n"
         "/logout - disconnect and remove your saved session\n"
-        "/setchatid <chat_id> - set the target chat that receives numbers and reports SUCCESS/FAILED\n"
+        "/setchatid <chat_id> - set the target chat that receives numbers and reports the result\n"
         "/otpgroups - manage OTP search sets (Name = pattern = group IDs)\n"
         "/numberfiles - saved .txt number files (kept 48h, resume where you stopped)\n"
         "/getallid - list the chat IDs of your logged-in account\n"
@@ -3493,11 +3549,13 @@ async def start_handler(message: Message):
         "4) If the device requests a code, the bot searches your OTP groups (short backfill + live handlers) "
         f"for the number-derived pattern and sends the OTP it finds to the device. After {NO_CODE_AFTER_SECONDS}s without a code the "
         "device gets no_code and the search keeps going. blocked / try_again end the number at any point.\n"
-        "5) After the code is sent the bot waits for the device (up to 5 minutes): continue starts the chat check, "
-        "error searches for a new code.\n"
-        "6) On continue, your logged-in account sends the plain number (no forward tag) to the target chat and a live "
-        "handler waits for a newer message with the exact, case-sensitive word SUCCESS, FAILED or BANNED, then tells "
-        "the device to clear and moves to the next number."
+        f"5) All waiting on the device shares one {DEVICE_STATE_WAIT_SECONDS // 60}-minute budget counted from the check. "
+        "After the code is sent: continue starts the chat check, error searches for a new code.\n"
+        "6) On continue, your logged-in account sends the plain number (no forward tag) to the target chat and waits up to "
+        f"{RESULT_WAIT_SECONDS // 60} minutes for a newer (or newly edited) message containing the exact, case-sensitive word "
+        f"{', '.join(RESULT_KEYWORDS)}. SUCCESS shows 🟢 Success, anything else 🟠 Failure.\n"
+        "7) When a number ends on a timeout, or a result shows up in the chat, the device is told to clear before the "
+        "next number starts. Bad / Try Later / error / skipped are not cleared, and no_code is not an ending."
     )
     await message.answer(help_text)
 
@@ -3924,6 +3982,18 @@ async def _wait_event(event: asyncio.Event, timeout: float) -> bool:
         waiter.cancel()
 
 
+def _chat_seen_summary(user_id: int, sent_id: Optional[int]) -> str:
+    """Explains a chat timeout: what (if anything) showed up after our message."""
+    if not sent_id:
+        return ""
+    seen = recent_chat_messages.get(user_id) or {}
+    newer = [(i, t) for i, t in seen.items() if i > sent_id]
+    if not newer:
+        return "\nNothing new was seen in the target chat after your message (check the target chat ID)."
+    last = " ".join(newer[-1][1].split())[:60]
+    return f"\nSeen after your message: {len(newer)} message(s), none matched this number. Last: \"{last}\""
+
+
 def _scope_label(otp_set_name: Optional[str]) -> str:
     return otp_set_name if otp_set_name else "All Groups"
 
@@ -4037,29 +4107,31 @@ async def _search_for_otp(num_msg, user_id: int, num: str, otp_set_name: Optiona
     return {"outcome": "none"}
 
 
-async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str]) -> bool:
+async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str], device_deadline: float) -> str:
     """
     Device asked for a code: search, send it, then wait for the device's state before deciding anything.
       continue -> True (go on to the chat check)
-      error    -> search again for a new code, all inside the same 5-minute device state wait
+      error    -> search again for a new code, all inside the shared 5-minute device budget
       blocked / try_again at any point -> the number ends here (Bad / Try Later)
-    Returns False when the number is finished.
+    Returns "continue", "timeout" (the number ended on a timeout) or "ended" (finished any other way).
     """
     global device_status
     scope_label = _scope_label(otp_set_name)
     await num_msg.edit_text(f"{num} ⚪ Device requested code. Searching OTP groups ({scope_label})...")
 
     sent_codes: Set[str] = set()
-    state_deadline: Optional[float] = None   # starts when the first code is sent
-    duration = OTP_SEARCH_DURATION
+    duration = min(OTP_SEARCH_DURATION, max(0.0, device_deadline - time.time()))
 
-    async def finish(text: str, status: str) -> bool:
+    async def finish(text: str, status: str, timed_out: bool = False) -> str:
         await num_msg.edit_text(f"{num} {text}")
         await log_number_status(num, status)
-        return False
+        return "timeout" if timed_out else "ended"
+
+    if device_deadline - time.time() <= 0:
+        return await finish("🟠 Ended (Device timeout - 5 mins)", "device_timeout", timed_out=True)
 
     while True:
-        res = await _search_for_otp(num_msg, user_id, num, otp_set_name, duration, sent_codes, state_deadline)
+        res = await _search_for_otp(num_msg, user_id, num, otp_set_name, duration, sent_codes, device_deadline)
         outcome = res["outcome"]
 
         if outcome == "skip":
@@ -4073,9 +4145,10 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
                 f"🔴 No OTP available. Skipping.\n(no usable OTP search pattern for this number in {scope_label}; check /otpgroups)",
                 "no_otp_found")
         if outcome == "none":
+            # the search window ran out without a code: that is a timeout
             if sent_codes:
-                return await finish("🔴 No new OTP found after the device error. Skipping.", "no_otp_found")
-            return await finish("🔴 No OTP available. Skipping.", "no_otp_found")
+                return await finish("🔴 No new OTP found after the device error. Skipping.", "no_otp_found", timed_out=True)
+            return await finish("🔴 No OTP available. Skipping.", "no_otp_found", timed_out=True)
 
         code, set_name = res["code"], res["set_name"]
         sent_codes.add(code)
@@ -4087,12 +4160,10 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
         device_event.clear()
         device_status = None
         await call_device_api(num, payload_type="send_code", code=code)
-        if state_deadline is None:
-            state_deadline = time.time() + DEVICE_STATE_WAIT_SECONDS
 
-        state = await _wait_device_state(state_deadline)
+        state = await _wait_device_state(device_deadline)
         if state == "continue":
-            return True
+            return "continue"
         if state == "skip":
             return await finish("⏭️ Skipped", "skipped")
         if state == "blocked":
@@ -4100,24 +4171,29 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
         if state == "try_again":
             return await finish("🟡 Try Later", "try_again")
         if state == "timeout":
-            return await finish("🟠 Ended (Device timeout after sending code - 5 mins)", "device_timeout_after_code")
+            return await finish("🟠 Ended (Device timeout after sending code - 5 mins)", "device_timeout_after_code", timed_out=True)
 
         # state == "error": look for a new code, still inside the same device state wait
-        remaining = state_deadline - time.time()
+        remaining = device_deadline - time.time()
         if remaining <= 0:
-            return await finish("🟠 Ended (Device timeout after sending code - 5 mins)", "device_timeout_after_code")
+            return await finish("🟠 Ended (Device timeout after sending code - 5 mins)", "device_timeout_after_code", timed_out=True)
         await num_msg.edit_text(f"{num} 🔁 Device reported an error. Rechecking OTP ({scope_label})...")
         duration = min(OTP_SEARCH_DURATION, remaining)
 
 
 async def process_number(message: Message, user_id: int, target_chat: Optional[int], num: str,
-                         otp_set_name: Optional[str] = None) -> None:
-    """Runs one number through device check -> OTP search/send -> no-tag forward -> SUCCESS/FAILED/BANNED -> clear."""
+                         otp_set_name: Optional[str] = None) -> Optional[str]:
+    """
+    Runs one number through device check -> OTP search/send -> no-tag forward -> chat result.
+    Returns "timeout" or "result" when the device has to be told to clear before the next number
+    (the number ended on a timeout, or a result was seen in the chat); None for every other ending.
+    """
     global device_status
     num_msg = await message.answer(f"{num} ⏳ Checking on device...")
 
     device_event.clear()
     device_status = None
+    device_deadline = time.time() + DEVICE_STATE_WAIT_SECONDS   # one shared budget for all waiting on the device
 
     success = await call_device_api(num, payload_type="check")
     if not success:
@@ -4125,7 +4201,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
         await log_number_status(num, "webhook_error")
         return
 
-    got_answer = await _wait_event(device_event, DEVICE_STATE_WAIT_SECONDS)
+    got_answer = await _wait_event(device_event, max(0.0, device_deadline - time.time()))
     _raise_if_stopped()
     if not got_answer:
         if skip_current_number:
@@ -4134,7 +4210,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
             return
         await num_msg.edit_text(f"{num} 🟠 Ended (Device timeout - 5 mins)")
         await log_number_status(num, "device_timeout")
-        return
+        return "timeout"
 
     if skip_current_number:
         await num_msg.edit_text(f"{num} ⏭️ Skipped")
@@ -4159,8 +4235,9 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
         return
 
     if "request_code" in result_text or "requestcode" in result_text or "request-code" in result_text:
-        if not await _otp_stage(num_msg, user_id, num, otp_set_name):
-            return
+        stage = await _otp_stage(num_msg, user_id, num, otp_set_name, device_deadline)
+        if stage != "continue":
+            return "timeout" if stage == "timeout" else None
     else:
         result_after = (device_status or "").lower()
         if "continue" not in result_after and "continued" not in result_after and "proceed" not in result_after:
@@ -4169,7 +4246,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
             return
 
     _raise_if_stopped()
-    await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting SUCCESS/FAILED/BANNED...")
+    await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting {'/'.join(RESULT_KEYWORDS)}...")
 
     if not target_chat:
         await num_msg.edit_text(f"{num} ⚠️ Target chat ID not set! Use /setchatid.")
@@ -4189,19 +4266,28 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
             logger.error("Failed to forward to target chat %s (%s)", target_chat, reason)
             await num_msg.edit_text(f"{num} ❌ Error forwarding to target chat ID.")
             return
-        arm_result_waiter(key, sent_info.get("message_id"))
+        sent_id = sent_info.get("message_id")
+        arm_result_waiter(key, sent_id, sent_info.get("sent_date"))
 
-        got_result = await _wait_event(ev, DEVICE_STATE_WAIT_SECONDS)
+        # live handler only (new AND edited messages), like fordet: the chat is never polled
+        got_result = await _wait_event(ev, RESULT_WAIT_SECONDS)
         _raise_if_stopped()
+
         if got_result:
             decision = live_success_failure_results.get(key, "UNKNOWN")
-            await num_msg.edit_text(f"{num} 🏁 Result Decided: {decision}")
+            if decision == "SUCCESS":
+                await num_msg.edit_text(f"{num} 🟢 Success")
+            else:
+                await num_msg.edit_text(f"{num} 🟠 Failure")
             await log_number_status(num, decision.lower())
-            # SUCCESS, FAILED or BANNED: tell the device to clear, then on to the next number
-            await call_device_api(num, payload_type="clear")
-        else:
-            await num_msg.edit_text(f"{num} 🟠 Live decision timeout (No SUCCESS/FAILED/BANNED received)")
-            await log_number_status(num, "decision_timeout")
+            return "result"
+
+        await num_msg.edit_text(
+            f"{num} 🟠 Live decision timeout (No {'/'.join(RESULT_KEYWORDS)} received)"
+            f"{_chat_seen_summary(user_id, sent_id)}"
+        )
+        await log_number_status(num, "decision_timeout")
+        return "timeout"
     finally:
         live_success_failure_events.pop(key, None)
         live_success_failure_results.pop(key, None)
@@ -4267,12 +4353,19 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             _raise_if_stopped()
             await status_msg.edit_text(f"Processing batch\n\nProgress: {idx + 1}/{total}\nTarget: {num}")
 
-            await process_number(message, user_id, target_chat, num, otp_set_name)
+            outcome = await process_number(message, user_id, target_chat, num, otp_set_name)
 
             completed = idx + 1
             if file_id is not None:
                 await db_set_file_progress(file_id, completed)
 
+            _raise_if_stopped()
+
+            # a number that ended on a timeout (any of them) or with a chat result is followed by clear before the
+            # next number starts; Bad / Try Later / error / skipped are not
+            if outcome in ("timeout", "result"):
+                if not await call_device_api(num, payload_type="clear"):
+                    logger.warning(f"Could not send clear for {num}")
             _raise_if_stopped()
 
             # same short pause after every number, however it ended
