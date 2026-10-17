@@ -60,6 +60,8 @@ OTP_PICK_PER_PAGE = 10
 PENDING_BATCH_TTL = 600  # seconds a picked-but-unstarted batch stays valid (10 minutes)
 NO_CODE_AFTER_SECONDS = int(os.getenv("NO_CODE_AFTER_SECONDS", "40"))  # tell the device "no_code" after this long without a code
 DEVICE_STATE_WAIT_SECONDS = 300  # ONE shared budget for all waiting on the device, counted from the check
+RETRY_AFTER_SECONDS = int(os.getenv("RETRY_AFTER_SECONDS", "90"))  # silence after the check before type=retry is sent
+RETRY_MAX = int(os.getenv("RETRY_MAX", "2"))  # retries per number (the last one is the last)
 RESULT_WAIT_SECONDS = int(os.getenv("RESULT_WAIT_SECONDS", "180"))  # separate wait for the chat result (3 minutes)
 # words the chat can answer with: any capitalisation, "contains"; the first one found in a message wins.
 # SUCCESS also covers successful / successfully; "unsuccessful", "unbanned" and "unblocked" are not matches.
@@ -173,9 +175,14 @@ _SCHEMA_STATEMENTS = [
             total INTEGER NOT NULL,
             next_index INTEGER NOT NULL DEFAULT 0,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-            expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+            expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+            scope_chosen BOOLEAN NOT NULL DEFAULT FALSE,
+            scope_set_name TEXT
         )"""),
     ("ix_number_files_user", "CREATE INDEX IF NOT EXISTS ix_number_files_user ON number_files (user_id, created_at)"),
+    # files created before the OTP group was remembered per file
+    ("number_files.scope_chosen", "ALTER TABLE number_files ADD COLUMN IF NOT EXISTS scope_chosen BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("number_files.scope_set_name", "ALTER TABLE number_files ADD COLUMN IF NOT EXISTS scope_set_name TEXT"),
     # prevents duplicate set names per user (add_otp_set relies on this)
     ("ux_otp_groups_user_name", "CREATE UNIQUE INDEX IF NOT EXISTS ux_otp_groups_user_name ON otp_groups (user_id, name)"),
 ]
@@ -3640,11 +3647,13 @@ async def start_handler(message: Message):
         "How it works:\n"
         "1) /login and complete the interactive login flow\n"
         "2) /otpgroups to add OTP sets, e.g. HK = 2|TGT|3 = -100123456789\n"
-        "3) Send numbers as text, or send a .txt file, then pick which OTP group to search (or All Groups). Files are saved while you are logged in, so you can resume them\n"
+        "3) Send numbers as text, or send a .txt file, then pick which OTP group to search (or All Groups). Files are saved while you are logged in, so you can resume them. A file remembers the OTP group you picked; change it from the file's menu in /numberfiles\n"
         "4) If the device requests a code, the bot searches your OTP groups (short backfill + live handlers) "
         f"for the number-derived pattern and sends the OTP it finds to the device. After {NO_CODE_AFTER_SECONDS}s without a code the "
         "device gets no_code and the search keeps going. blocked / try_again end the number at any point.\n"
         f"5) All waiting on the device shares one {DEVICE_STATE_WAIT_SECONDS // 60}-minute budget counted from the check. "
+        f"If the device does not answer the check at all, it gets type=retry after {RETRY_AFTER_SECONDS}s and once more "
+        f"{RETRY_AFTER_SECONDS}s later; any response from the device stops the retrying for that number. "
         "After the code is sent: continue starts the chat check, error searches for a new code.\n"
         "6) On continue, your logged-in account sends the plain number (no forward tag) to the target chat, then tells the "
         "device type=wscode. A code the device sends back to /device_callback?wscode=... is sent as a reply to the latest "
@@ -3960,7 +3969,7 @@ async def db_list_number_files(user_id: int) -> List[Dict]:
 async def db_get_number_file(user_id: int, file_id: int, with_numbers: bool = False) -> Optional[Dict]:
     if not db_pool:
         return None
-    cols = "id, name, total, next_index, created_at, expires_at"
+    cols = "id, name, total, next_index, created_at, expires_at, scope_chosen, scope_set_name"
     if with_numbers:
         cols += ", numbers::text AS numbers"
     try:
@@ -3988,6 +3997,22 @@ async def db_set_file_progress(file_id: int, next_index: int) -> None:
             await conn.execute("UPDATE number_files SET next_index = $2 WHERE id = $1", file_id, next_index)
     except Exception as e:
         logger.warning(f"Could not save progress for file {file_id}: {e}")
+
+
+async def db_set_file_scope(user_id: int, file_id: int, set_name: Optional[str], chosen: bool = True) -> bool:
+    """Remembers which OTP group a file uses: a set name, or None for All Groups (chosen=False forgets the choice)."""
+    if not db_pool:
+        return False
+    try:
+        async with db_pool.acquire() as conn:
+            status = await conn.execute(
+                "UPDATE number_files SET scope_chosen = $3, scope_set_name = $4 WHERE id = $1 AND user_id = $2",
+                file_id, user_id, chosen, set_name if chosen else None,
+            )
+        return int(status.split()[-1]) > 0
+    except Exception as e:
+        logger.exception(f"Error saving the OTP group of file {file_id}: {e}")
+        return False
 
 
 async def db_delete_number_file(user_id: int, file_id: int) -> bool:
@@ -4045,6 +4070,17 @@ def _claim_batch() -> bool:
         return False
     is_processing = True
     return True
+
+
+def _spawn_batch(message: Message, user_id: int, numbers: List[str], file_id: Optional[int], start_index: int,
+                 file_name: Optional[str], otp_set_name: Optional[str]) -> None:
+    """Starts the (already claimed) batch in the background so the button press returns at once."""
+    task = asyncio.create_task(run_batch(
+        message, user_id, numbers, file_id=file_id, start_index=start_index,
+        file_name=file_name, otp_set_name=otp_set_name,
+    ))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 async def _batch_preconditions(user_id: int) -> Optional[Tuple[str, Optional[str]]]:
@@ -4279,6 +4315,33 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
         duration = min(OTP_SEARCH_DURATION, remaining)
 
 
+async def _wait_first_device_answer(num_msg, num: str, check_sent_at: float, deadline: float) -> bool:
+    """
+    Waits for the device's first answer to the check (any callback counts). Only if the device stays completely
+    silent is type=retry sent: after RETRY_AFTER_SECONDS, and once more after another RETRY_AFTER_SECONDS
+    (RETRY_MAX in total, the last one is the last). The moment the device responds in any way the retrying is
+    over for this number: nothing after the check (code, chat result...) is ever retried.
+    Returns True when the device answered, False when the shared budget ran out.
+    """
+    retries = 0
+    window_start = check_sent_at
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return False
+        retry_at = window_start + RETRY_AFTER_SECONDS if retries < RETRY_MAX else None
+        timeout = remaining if retry_at is None else min(remaining, max(0.0, retry_at - time.time()))
+        if await _wait_event(device_event, timeout):
+            return True
+        _raise_if_stopped()
+        if retry_at is not None and time.time() >= retry_at - 0.001 and deadline - time.time() > 0:
+            retries += 1
+            await num_msg.edit_text(f"{num} ⏳ No response from the device. Retry {retries}/{RETRY_MAX} sent...")
+            if not await call_device_api(num, payload_type="retry"):
+                logger.warning(f"Could not send retry {retries} for {num}")
+            window_start = time.time()      # the next 90s of silence are counted from this retry
+
+
 async def process_number(message: Message, user_id: int, target_chat: Optional[int], num: str,
                          otp_set_name: Optional[str] = None) -> Optional[str]:
     """
@@ -4291,7 +4354,8 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
 
     device_event.clear()
     device_status = None
-    device_deadline = time.time() + DEVICE_STATE_WAIT_SECONDS   # one shared budget for all waiting on the device
+    check_sent_at = time.time()
+    device_deadline = check_sent_at + DEVICE_STATE_WAIT_SECONDS   # one shared budget for all waiting on the device
 
     success = await call_device_api(num, payload_type="check")
     if not success:
@@ -4299,7 +4363,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
         await log_number_status(num, "webhook_error")
         return
 
-    got_answer = await _wait_event(device_event, max(0.0, device_deadline - time.time()))
+    got_answer = await _wait_first_device_answer(num_msg, num, check_sent_at, device_deadline)
     _raise_if_stopped()
     if not got_answer:
         if skip_current_number:
@@ -4545,6 +4609,9 @@ async def offer_batch(message: Message, user_id: int, numbers: List[str],
 
 
 def _pending_summary(p: Dict) -> str:
+    if p.get("mode") == "assign":
+        return (f"📄 <b>{html.escape(p['file_name'])}</b>: pick the OTP group this file uses from now on. "
+                "It is remembered, and you can change it here anytime.")
     count = f"{len(p['numbers']):,} numbers"
     if p['file_id'] is None:
         return f"📝 Pasted batch: {count}"
@@ -4567,7 +4634,11 @@ async def build_otp_picker_view(user_id: int, page: int, header: Optional[str] =
     lines += ["Choose which OTP set to search for codes, or <b>All Groups</b> to search every set.", ""]
 
     keyboard = []
-    keyboard.append([InlineKeyboardButton("🌐 All Groups", callback_data="otpsel_all")])
+    current = p.get("current") if p else None        # (chosen, set name) while changing a file's group
+    all_label = "🌐 All Groups"
+    if current and current[0] and current[1] is None:
+        all_label = "✅ " + all_label
+    keyboard.append([InlineKeyboardButton(all_label, callback_data="otpsel_all")])
 
     row = []
     for s in sets[page * OTP_PICK_PER_PAGE:(page + 1) * OTP_PICK_PER_PAGE]:
@@ -4576,7 +4647,10 @@ async def build_otp_picker_view(user_id: int, page: int, header: Optional[str] =
             f"{number}. <b>{html.escape(s['name'])}</b>\n"
             f"    🧩 {len(s.get('formats', []))} format(s) • 👥 {len(s.get('group_ids', []))} group(s)"
         )
-        row.append(InlineKeyboardButton(_btn_label(number, s['name']), callback_data=f"otpsel_{s['set_index']}"))
+        label = _btn_label(number, s['name'])
+        if current and current[0] and current[1] == s['name']:
+            label = "✅ " + label
+        row.append(InlineKeyboardButton(label, callback_data=f"otpsel_{s['set_index']}"))
         if len(row) == 2:
             keyboard.append(row)
             row = []
@@ -4625,9 +4699,16 @@ async def otpsel_callback_handler(callback: CallbackQuery):
         await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
         return
 
+    assign_mode = pending.get("mode") == "assign"
+
     if action == "otpsel_cancel":
         pending_batches.pop(user_id, None)
         await query.answer()
+        if assign_mode:
+            view = await build_file_view(user_id, pending["file_id"])
+            if view:
+                await query.edit_message_text(view[0], reply_markup=view[1], parse_mode="HTML")
+                return
         await query.edit_message_text("❎ Cancelled. Nothing was started.")
         return
 
@@ -4647,18 +4728,29 @@ async def otpsel_callback_handler(callback: CallbackQuery):
             return
         otp_set_name = match['name']
 
+    if assign_mode:
+        # changing the group a file remembers: nothing is started
+        saved = await db_set_file_scope(user_id, pending["file_id"], otp_set_name)
+        pending_batches.pop(user_id, None)
+        await query.answer("Saved" if saved else "Couldn't save that", show_alert=not saved)
+        notice = (f"✅ This file will use <b>{html.escape(_scope_label(otp_set_name))}</b> from now on." if saved
+                  else "⚠️ Couldn't save the OTP group, please try again.")
+        view = await build_file_view(user_id, pending["file_id"], notice)
+        if view:
+            await query.edit_message_text(view[0], reply_markup=view[1], parse_mode="HTML")
+        else:
+            await query.edit_message_text("⚠️ That file no longer exists (deleted or expired).")
+        return
+
     if not _claim_batch():
         await query.answer("⚠️ Another batch is running. Use /stop to stop it first.", show_alert=True)
         return
 
     pending_batches.pop(user_id, None)
-    task = asyncio.create_task(run_batch(
-        callback.message, user_id, pending['numbers'],
-        file_id=pending['file_id'], start_index=pending['start_index'],
-        file_name=pending['file_name'], otp_set_name=otp_set_name,
-    ))
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    if pending['file_id'] is not None:
+        await db_set_file_scope(user_id, pending['file_id'], otp_set_name)      # the file remembers its group
+    _spawn_batch(callback.message, user_id, pending['numbers'], pending['file_id'], pending['start_index'],
+                 pending['file_name'], otp_set_name)
 
     await query.answer()
     try:
@@ -4827,7 +4919,7 @@ async def build_numberfiles_view(user_id: int, page: int, notice: Optional[str] 
     return "\n".join(lines), InlineKeyboardMarkup(keyboard)
 
 
-async def build_file_view(user_id: int, file_id: int):
+async def build_file_view(user_id: int, file_id: int, notice: Optional[str] = None):
     rec = await db_get_number_file(user_id, file_id)
     if not rec:
         return None
@@ -4841,17 +4933,27 @@ async def build_file_view(user_id: int, file_id: int):
     else:
         resume_hint = "Resume starts from the beginning."
 
+    chosen = bool(rec.get("scope_chosen"))
+    if chosen:
+        group_line = f"🤖 OTP group: <b>{html.escape(_scope_label(rec.get('scope_set_name')))}</b>"
+    else:
+        group_line = "🤖 OTP group: not chosen yet (you'll be asked when you start)"
+
     text = (
         f"📄 <b>{html.escape(rec['name'])}</b>\n\n"
         f"🔢 Numbers: {total:,}\n"
         f"📊 Progress: {_file_progress_text(rec)}\n"
+        f"{group_line}\n"
         f"⏳ Expires in: {_fmt_time_left(rec['expires_at'])}\n\n"
         f"{resume_hint}"
     )
+    if notice:
+        text = f"{notice}\n\n{text}"
     page = user_data_store.get(user_id, {}).get('nf_page', 0)
     keyboard = [
         [InlineKeyboardButton("▶️ Resume", callback_data=f"nf_resume_{file_id}"),
          InlineKeyboardButton("🗑 Delete", callback_data=f"nf_del_{file_id}")],
+        [InlineKeyboardButton("🤖 Change OTP group" if chosen else "🤖 Choose OTP group", callback_data=f"nf_group_{file_id}")],
         [InlineKeyboardButton("🔙 Back", callback_data=f"nf_page_{page}")],
     ]
     return text, InlineKeyboardMarkup(keyboard)
@@ -4940,9 +5042,48 @@ async def nf_callback_handler(callback: CallbackQuery):
             return
 
         start = rec["next_index"] if 0 < rec["next_index"] < rec["total"] else 0
+        notice = None
+        if rec.get("scope_chosen"):
+            saved_name = rec.get("scope_set_name")
+            if saved_name is None or any(x["name"] == saved_name for x in await db_get_otp_sets(user_id)):
+                # the file remembers its OTP group: no picker, it just starts
+                if not _claim_batch():
+                    await query.answer("⚠️ Another batch is running. Use /stop to stop it first.", show_alert=True)
+                    return
+                _spawn_batch(callback.message, user_id, rec["numbers"], rec["id"], start, rec["name"], saved_name)
+                await query.answer()
+                where = f"from number {start + 1}" if start else "from the beginning"
+                try:
+                    await query.edit_message_text(
+                        f"▶️ <b>{html.escape(rec['name'])}</b>: resuming {where} • OTP group: "
+                        f"<b>{html.escape(_scope_label(saved_name))}</b>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+                return
+            # the saved group was deleted or renamed: forget it and ask again
+            await db_set_file_scope(user_id, rec["id"], None, chosen=False)
+            notice = f"⚠️ The saved OTP group “{html.escape(saved_name)}” no longer exists. Pick another one."
         pending_batches[user_id] = dict(numbers=rec["numbers"], file_id=rec["id"], start_index=start,
                                         file_name=rec["name"], ts=time.time())
         await query.answer()
+        text, markup = await build_otp_picker_view(user_id, 0, notice)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
+    elif action.startswith("nf_group_"):
+        fid = file_id_from("nf_group_")
+        rec = await db_get_number_file(user_id, fid) if fid is not None else None
+        if not rec:
+            await query.answer()
+            await show_list(context.user_data.get('nf_page', 0), "⚠️ That file no longer exists (deleted or expired).")
+            return
+        if not await db_get_otp_sets(user_id):
+            await query.answer("❌ No OTP sets found! Configure one with /otpgroups first.", show_alert=True)
+            return
+        await query.answer()
+        pending_batches[user_id] = dict(mode="assign", file_id=rec["id"], file_name=rec["name"], numbers=[], start_index=0,
+                                        current=(bool(rec.get("scope_chosen")), rec.get("scope_set_name")), ts=time.time())
         text, markup = await build_otp_picker_view(user_id, 0)
         await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
 
