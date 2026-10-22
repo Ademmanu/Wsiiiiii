@@ -62,6 +62,9 @@ NO_CODE_AFTER_SECONDS = int(os.getenv("NO_CODE_AFTER_SECONDS", "40"))  # tell th
 DEVICE_STATE_WAIT_SECONDS = 300  # ONE shared budget for all waiting on the device, counted from the check
 RETRY_AFTER_SECONDS = int(os.getenv("RETRY_AFTER_SECONDS", "90"))  # silence after the check before type=retry is sent
 RETRY_MAX = int(os.getenv("RETRY_MAX", "2"))  # retries per number (the last one is the last)
+PAUSE_AUTO_RESUME_SECONDS = int(os.getenv("PAUSE_AUTO_RESUME_SECONDS", "300"))  # how long a pause asked by the device lasts
+# which entries count as real phone numbers: "strict" = international shape AND libphonenumber says valid, "shape" = shape only
+NUMBER_CHECK_MODE = os.getenv("NUMBER_CHECK", "strict").lower()
 RESULT_WAIT_SECONDS = int(os.getenv("RESULT_WAIT_SECONDS", "180"))  # separate wait for the chat result (3 minutes)
 # words the chat can answer with: any capitalisation, "contains"; the first one found in a message wins.
 # SUCCESS also covers successful / successfully; "unsuccessful", "unbanned" and "unblocked" are not matches.
@@ -73,7 +76,7 @@ RESULT_PATTERNS = (
     ("BLOCKED", re.compile(r"(?<!un)blocked", re.IGNORECASE)),
     ("ERROR", re.compile(r"error", re.IGNORECASE)),
 )
-NEXT_NUMBER_DELAY_SECONDS = float(os.getenv("NEXT_NUMBER_DELAY_SECONDS", "3"))  # pause between numbers, however the last one ended
+NEXT_NUMBER_DELAY_SECONDS = float(os.getenv("NEXT_NUMBER_DELAY_SECONDS", "2"))  # pause between numbers, however the last one ended
 
 router = Router()
 bot_instance: Optional[Bot] = None
@@ -102,6 +105,8 @@ device_status: Optional[str] = None
 
 skip_current_number = False
 stop_requested = False  # set by /stop; every wait in the number flow checks it
+jump_requested_index: Optional[int] = None  # set by /jumpto: the 0-based index the file continues from
+pause_interrupt = False  # set by /pause: the number in flight is abandoned and restarts when /resume is used
 pause_event = asyncio.Event()
 pause_event.set()
 
@@ -3551,7 +3556,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
   /getallid - Get all your chat IDs
 
 ⚙️ **Batch Control:**
-  /pause | /resume | /next | /stats | /stop
+  /pause | /resume | /next | /jumpto | /stats | /stop
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
@@ -3643,7 +3648,9 @@ async def start_handler(message: Message):
         "/otpgroups - manage OTP search sets (Name = pattern = group IDs)\n"
         "/numberfiles - saved .txt number files (kept 48h, resume where you stopped)\n"
         "/getallid - list the chat IDs of your logged-in account\n"
-        "/pause | /resume | /next | /stats | /stop\n\n"
+        "/pause | /resume | /next | /jumpto <n> | /stats | /stop\n"
+        "/pause holds the batch and /resume restarts the number you paused on. /jumpto <n> jumps to number n of the file "
+        "being processed (1 to the file's total).\n\n"
         "How it works:\n"
         "1) /login and complete the interactive login flow\n"
         "2) /otpgroups to add OTP sets, e.g. HK = 2|TGT|3 = -100123456789\n"
@@ -3654,15 +3661,20 @@ async def start_handler(message: Message):
         f"5) All waiting on the device shares one {DEVICE_STATE_WAIT_SECONDS // 60}-minute budget counted from the check. "
         f"If the device does not answer the check at all, it gets type=retry after {RETRY_AFTER_SECONDS}s and once more "
         f"{RETRY_AFTER_SECONDS}s later; any response from the device stops the retrying for that number. "
-        "After the code is sent: continue starts the chat check, error searches for a new code.\n"
+        "After the code is sent: continue starts the chat check, error searches for a new code, and success / failure "
+        "straight from the device ends the number at once (🟢 Success / 🟠 Failure). While the chat is awaited the device "
+        "can still report success / failure too; whichever comes first wins.\n"
         "6) On continue, your logged-in account sends the plain number (no forward tag) to the target chat, then tells the "
         "device type=wscode. A code the device sends back to /device_callback?wscode=... is sent as a reply to the latest "
         "message the chat sent you, while the bot waits up to "
         f"{RESULT_WAIT_SECONDS // 60} minutes for a newer (or newly edited) message containing "
         f"{', '.join(RESULT_KEYWORDS)} (any capitalisation; successful / successfully count as SUCCESS). "
         "SUCCESS shows 🟢 Success, anything else 🟠 Failure. If no code comes back the bot just waits.\n"
-        "7) When a number ends on a timeout, or a result shows up in the chat, the device is told to clear before the "
-        "next number starts. Bad / Try Later / error / skipped are not cleared, and no_code is not an ending."
+        "7) When a number ends on a timeout, or a result is decided (from the chat or from the device), the device is told to clear before the "
+        "next number starts. Bad Num / Try Later / error / skipped are not cleared, and no_code is not an ending.\n"
+        f"8) Only real phone numbers (with a country code, with or without +) are processed; anything else is ignored. "
+        f"If the device returns pause, the batch holds for {_human_secs(PAUSE_AUTO_RESUME_SECONDS)} and then restarts that same number "
+        "from its start (a pause is not acted on once the number is in the chat)."
     )
     await message.answer(help_text)
 
@@ -4052,8 +4064,50 @@ async def _expired_files_cleanup_loop():
 # ------------------------------------------------------------
 # Batch runner (shared by pasted text, sent files and /numberfiles → Resume)
 # ------------------------------------------------------------
+_NUMBER_SHAPE = re.compile(r"^\+?[1-9]\d{6,14}$")    # optional +, no leading 0, 7-15 digits (the E.164 length range)
+
+
+def is_real_number(token: str) -> bool:
+    """
+    A real international phone number, with or without the leading +. Words, short codes, numbers without a
+    country code and numbers libphonenumber rejects are not real.
+    """
+    token = (token or "").strip()
+    if not _NUMBER_SHAPE.match(token):
+        return False
+    if NUMBER_CHECK_MODE == "shape":
+        return True
+    try:
+        parsed = phonenumbers.parse(token if token.startswith("+") else "+" + token, None)
+        return bool(phonenumbers.is_valid_number(parsed))
+    except Exception:
+        return False
+
+
+def extract_real_numbers(text: str) -> Tuple[List[str], List[str]]:
+    """Splits on commas / whitespace and returns (real numbers, ignored entries), both in the original order."""
+    real: List[str] = []
+    ignored: List[str] = []
+    for token in re.split(r"[,\s]+", text or ""):
+        token = token.strip()
+        if not token:
+            continue
+        (real if is_real_number(token) else ignored).append(token)
+    return real, ignored
+
+
 def parse_numbers(text: str) -> List[str]:
-    return [n.strip() for n in re.split(r"[,\s]+", text) if n.strip()]
+    return extract_real_numbers(text)[0]
+
+
+def _ignored_note(ignored: List[str], html_mode: bool = False) -> str:
+    if not ignored:
+        return ""
+    shown = ", ".join((t if len(t) <= 20 else t[:20] + "…") for t in ignored[:5])
+    more = f" (+{len(ignored) - 5} more)" if len(ignored) > 5 else ""
+    noun = "entry that is" if len(ignored) == 1 else "entries that are"
+    text = f"ℹ️ Ignored {len(ignored)} {noun} not real phone numbers: {shown}{more}"
+    return html.escape(text) if html_mode else text
 
 
 def decode_file_bytes(raw: bytes) -> str:
@@ -4135,21 +4189,45 @@ def _scope_label(otp_set_name: Optional[str]) -> str:
 def _search_interrupt_from_status() -> Optional[str]:
     """While searching for a code, blocked / try_again from the device end the number
     (it can turn out bad or delayed after the code was requested)."""
+    if pause_interrupt:
+        return "pause"                  # the user pressed /pause: abandon this number, /resume restarts it
     status = (device_status or "").lower()
     if "blocked" in status:
         return "blocked"
     if "try_again" in status:
         return "try_again"
+    if "pause" in status:
+        return "pause"                  # the device asked for a pause
+    return None
+
+
+_DEVICE_SUCCESS = re.compile(r"(?<!un)success")
+
+
+def _device_outcome_from_status() -> Optional[str]:
+    """A final outcome reported by the device itself: success (also successful) or failure (also failed)."""
+    status = (device_status or "").lower()
+    if _DEVICE_SUCCESS.search(status):
+        return "success"
+    if "fail" in status:
+        return "failure"
     return None
 
 
 def _device_state_from_status() -> Optional[str]:
     """What the device answered after we sent it a code."""
+    if pause_interrupt:
+        return "pause"
     status = (device_status or "").lower()
     if "blocked" in status:
         return "blocked"
     if "try_again" in status:
         return "try_again"
+    if "pause" in status:
+        return "pause"
+    outcome = _device_outcome_from_status()
+    if outcome:
+        return outcome                  # success / failure straight from the device, no continue needed
     if "error" in status and "request_code" not in status:
         return "error"
     if "continue" in status or "proceed" in status:
@@ -4159,7 +4237,7 @@ def _device_state_from_status() -> Optional[str]:
 
 async def _wait_device_state(deadline: float) -> str:
     """Waits (inside the 5-minute device state wait) until the device answers.
-    Returns blocked | try_again | error | continue | skip | timeout. Other callbacks are ignored."""
+    Returns blocked | try_again | success | failure | error | continue | skip | timeout. Other callbacks are ignored."""
     while True:
         _raise_if_stopped()
         state = _device_state_from_status()
@@ -4246,8 +4324,9 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
     Device asked for a code: search, send it, then wait for the device's state before deciding anything.
       continue -> True (go on to the chat check)
       error    -> search again for a new code, all inside the shared 5-minute device budget
-      blocked / try_again at any point -> the number ends here (Bad / Try Later)
-    Returns "continue", "timeout" (the number ended on a timeout) or "ended" (finished any other way).
+      blocked / try_again at any point -> the number ends here (Bad Num / Try Later)
+    Returns "continue", "result" (the device itself reported success / failure), "timeout" (the number ended on
+    a timeout), "pause" (the device asked for a pause, or /pause was used: the number restarts later) or "ended".
     """
     global device_status
     scope_label = _scope_label(otp_set_name)
@@ -4261,6 +4340,10 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
         await log_number_status(num, status)
         return "timeout" if timed_out else "ended"
 
+    async def paused() -> str:
+        await _device_pause_notice(num_msg, num)
+        return "pause"
+
     if device_deadline - time.time() <= 0:
         return await finish("🟠 Ended (Device timeout - 5 mins)", "device_timeout", timed_out=True)
 
@@ -4271,9 +4354,11 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
         if outcome == "skip":
             return await finish("⏭️ Skipped", "skipped")
         if outcome == "blocked":
-            return await finish("⚫ Bad", "blocked")
+            return await finish("⚫ Bad Num", "blocked")
         if outcome == "try_again":
             return await finish("🟡 Try Later", "try_again")
+        if outcome == "pause":
+            return await paused()
         if outcome == "nopattern":
             return await finish(
                 f"🔴 No OTP available. Skipping.\n(no usable OTP search pattern for this number in {scope_label}; check /otpgroups)",
@@ -4298,12 +4383,19 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
         state = await _wait_device_state(device_deadline)
         if state == "continue":
             return "continue"
+        if state in ("success", "failure"):
+            # the device reports the outcome before (or without) continue: an earlier, faster result
+            await num_msg.edit_text(f"{num} 🟢 Success" if state == "success" else f"{num} 🟠 Failure")
+            await log_number_status(num, state, "from device")
+            return "result"
         if state == "skip":
             return await finish("⏭️ Skipped", "skipped")
         if state == "blocked":
-            return await finish("⚫ Bad", "blocked")
+            return await finish("⚫ Bad Num", "blocked")
         if state == "try_again":
             return await finish("🟡 Try Later", "try_again")
+        if state == "pause":
+            return await paused()
         if state == "timeout":
             return await finish("🟠 Ended (Device timeout after sending code - 5 mins)", "device_timeout_after_code", timed_out=True)
 
@@ -4313,6 +4405,54 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
             return await finish("🟠 Ended (Device timeout after sending code - 5 mins)", "device_timeout_after_code", timed_out=True)
         await num_msg.edit_text(f"{num} 🔁 Device reported an error. Rechecking OTP ({scope_label})...")
         duration = min(OTP_SEARCH_DURATION, remaining)
+
+
+def _human_secs(seconds: float) -> str:
+    return f"{seconds / 60:g} minutes" if seconds >= 60 else f"{seconds:g} seconds"
+
+
+async def _device_pause_notice(num_msg, num: str) -> None:
+    if pause_interrupt:
+        await num_msg.edit_text(f"{num} ⏸️ Paused. This number restarts from its start when you /resume.")
+    else:
+        await num_msg.edit_text(f"{num} ⏸️ Device asked to pause. Restarting this number in {_human_secs(PAUSE_AUTO_RESUME_SECONDS)}...")
+    await log_number_status(num, "paused")
+
+
+async def _device_pause(message: Message, status_msg, idx: int, total: int) -> None:
+    """
+    The device asked for a pause: hold the batch for PAUSE_AUTO_RESUME_SECONDS (or until /resume), then the same
+    number is redone from its start.
+    """
+    global is_paused
+    is_paused = True
+    pause_event.clear()
+    try:
+        await status_msg.edit_text(
+            f"⏸️ Paused by the device at number {idx + 1}/{total}. This number restarts from its start in "
+            f"{_human_secs(PAUSE_AUTO_RESUME_SECONDS)} (or use /resume)."
+        )
+    except Exception:
+        pass
+    resumed_by_user = await _wait_event(pause_event, PAUSE_AUTO_RESUME_SECONDS)
+    _raise_if_stopped()
+    if not resumed_by_user:
+        is_paused = False
+        pause_event.set()
+        try:
+            await message.answer(f"▶️ Pause over. Restarting number {idx + 1}/{total}...")
+        except Exception:
+            pass
+
+
+async def _take_jump(file_id: Optional[int]) -> int:
+    """Applies a pending /jumpto: returns the 0-based index to continue from and saves it as the file's position."""
+    global jump_requested_index
+    target = jump_requested_index
+    jump_requested_index = None
+    if file_id is not None:
+        await db_set_file_progress(file_id, target)
+    return target
 
 
 async def _wait_first_device_answer(num_msg, num: str, check_sent_at: float, deadline: float) -> bool:
@@ -4347,7 +4487,8 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
     """
     Runs one number through device check -> OTP search/send -> no-tag forward -> chat result.
     Returns "timeout" or "result" when the device has to be told to clear before the next number
-    (the number ended on a timeout, or a result was seen in the chat); None for every other ending.
+    (the number ended on a timeout, or a result was seen in the chat), "pause" when the number was abandoned
+    because of a pause (it is restarted later), and None for every other ending.
     """
     global device_status
     num_msg = await message.answer(f"{num} ⏳ Checking on device...")
@@ -4381,8 +4522,12 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
 
     result_text = (device_status or "").lower()
 
+    if pause_interrupt or "pause" in result_text:
+        await _device_pause_notice(num_msg, num)
+        return "pause"
+
     if "blocked" in result_text:
-        await num_msg.edit_text(f"{num} ⚫ Bad")
+        await num_msg.edit_text(f"{num} ⚫ Bad Num")
         await log_number_status(num, "blocked")
         return
 
@@ -4399,7 +4544,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
     if "request_code" in result_text or "requestcode" in result_text or "request-code" in result_text:
         stage = await _otp_stage(num_msg, user_id, num, otp_set_name, device_deadline)
         if stage != "continue":
-            return "timeout" if stage == "timeout" else None
+            return stage if stage in ("timeout", "result", "pause") else None
     else:
         result_after = (device_status or "").lower()
         if "continue" not in result_after and "continued" not in result_after and "proceed" not in result_after:
@@ -4407,8 +4552,22 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
             await log_number_status(num, "no_continue")
             return
 
+    # from here on only NEW device callbacks count: a success / failure the device sends now ends the number early
+    device_event.clear()
+    device_status = None
+
     _raise_if_stopped()
+    if skip_current_number:
+        await num_msg.edit_text(f"{num} ⏭️ Skipped")
+        await log_number_status(num, "skipped")
+        return None
     await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting {'/'.join(RESULT_KEYWORDS)}...")
+
+    early = _device_outcome_from_status()
+    if early:
+        await num_msg.edit_text(f"{num} 🟢 Success" if early == "success" else f"{num} 🟠 Failure")
+        await log_number_status(num, early, "from device")
+        return "result"
 
     if not target_chat:
         await num_msg.edit_text(f"{num} ⚠️ Target chat ID not set! Use /setchatid.")
@@ -4442,10 +4601,18 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
 
         # live handler only (new AND edited messages), like fordet: the chat is never polled
         got_result = False
+        skipped = False
+        device_outcome = None
         while True:
             _raise_if_stopped()
             if ev.is_set():
                 got_result = True
+                break
+            device_outcome = _device_outcome_from_status()   # success / failure straight from the device
+            if device_outcome:
+                break
+            if skip_current_number:          # /next while waiting for the result
+                skipped = True
                 break
             if result_deadline - time.time() <= 0:
                 break
@@ -4453,9 +4620,27 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
             if ev.is_set():
                 got_result = True
                 break
-            await _wait_any([ev, live_wscode_state[key]["wake"]], result_deadline - time.time())
+            device_outcome = _device_outcome_from_status()
+            if device_outcome:
+                break
+            if skip_current_number:
+                skipped = True
+                break
+            await _wait_any([ev, live_wscode_state[key]["wake"], device_event], result_deadline - time.time())
             live_wscode_state[key]["wake"].clear()
+            if device_event.is_set() and _device_outcome_from_status() is None:
+                device_event.clear()         # some other device callback: not an outcome, don't spin on it
         _raise_if_stopped()
+
+        if device_outcome and not got_result:
+            await num_msg.edit_text(f"{num} 🟢 Success" if device_outcome == "success" else f"{num} 🟠 Failure")
+            await log_number_status(num, device_outcome, "from device")
+            return "result"
+
+        if skipped:
+            await num_msg.edit_text(f"{num} ⏭️ Skipped")
+            await log_number_status(num, "skipped")
+            return None
 
         if got_result:
             decision = live_success_failure_results.get(key, "UNKNOWN")
@@ -4488,11 +4673,13 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
     crash or restart resumes at the number that was in flight (it is redone, never skipped).
     """
     global is_processing, is_paused, current_task, skip_current_number, current_index, \
-        total_numbers_count, active_number, active_file_id, stop_requested
+        total_numbers_count, active_number, active_file_id, stop_requested, jump_requested_index, pause_interrupt
 
     total = len(numbers)
     completed = start_index
     stop_requested = False
+    jump_requested_index = None
+    pause_interrupt = False
     try:
         problem = await _batch_preconditions(user_id)
         if problem:
@@ -4527,18 +4714,58 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
         header += f"\nOTP group: {_scope_label(otp_set_name)}"
         status_msg = await message.answer(header)
 
-        for idx in range(start_index, total):
+        idx = start_index
+        while idx < total:
             _raise_if_stopped()
+            if jump_requested_index is not None:          # a /jumpto that arrived between two numbers
+                idx = await _take_jump(file_id)
+                completed = idx
+                continue
             num = numbers[idx]
             current_index = idx + 1
             active_number = num
             skip_current_number = False
 
             await pause_event.wait()
+            pause_interrupt = False                        # a /pause pressed from here on abandons THIS number
             _raise_if_stopped()
+            if jump_requested_index is not None:          # a /jumpto while paused: applied at the top of the loop
+                continue
             await status_msg.edit_text(f"Processing batch\n\nProgress: {idx + 1}/{total}\nTarget: {num}")
 
-            outcome = await process_number(message, user_id, target_chat, num, otp_set_name)
+            if is_real_number(num):
+                outcome = await process_number(message, user_id, target_chat, num, otp_set_name)
+            else:
+                # (files saved before only real numbers were accepted)
+                await message.answer(f"{num} ⚪ Ignored (not a real phone number)")
+                await log_number_status(num, "invalid_number")
+                outcome = None
+
+            if jump_requested_index is not None:
+                # /jumpto: this number is abandoned and the file carries on from the number that was asked for
+                if outcome in ("timeout", "result"):
+                    if not await call_device_api(num, payload_type="clear"):
+                        logger.warning(f"Could not send clear for {num}")
+                idx = await _take_jump(file_id)
+                completed = idx
+                _raise_if_stopped()
+                if NEXT_NUMBER_DELAY_SECONDS > 0:
+                    await asyncio.sleep(NEXT_NUMBER_DELAY_SECONDS)
+                continue
+
+            if outcome == "pause":
+                # paused (by the device, or by /pause): nothing counts as done, the same number is redone from its start
+                manual = pause_interrupt
+                pause_interrupt = False
+                if manual:
+                    try:
+                        await status_msg.edit_text(f"⏸️ Paused at number {idx + 1}/{total}. /resume restarts this number from its start.")
+                    except Exception:
+                        pass
+                    # /pause already cleared pause_event: the top of the loop waits there until /resume
+                else:
+                    await _device_pause(message, status_msg, idx, total)
+                continue
 
             completed = idx + 1
             if file_id is not None:
@@ -4546,8 +4773,8 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
 
             _raise_if_stopped()
 
-            # a number that ended on a timeout (any of them) or with a chat result is followed by clear before the
-            # next number starts; Bad / Try Later / error / skipped are not
+            # a number that ended on a timeout (any of them) or with a result is followed by clear before the
+            # next number starts; Bad Num / Try Later / error / skipped are not
             if outcome in ("timeout", "result"):
                 if not await call_device_api(num, payload_type="clear"):
                     logger.warning(f"Could not send clear for {num}")
@@ -4556,6 +4783,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             # same short pause after every number, however it ended
             if idx < total - 1 and NEXT_NUMBER_DELAY_SECONDS > 0:
                 await asyncio.sleep(NEXT_NUMBER_DELAY_SECONDS)
+            idx += 1
 
         done_text = f"Batch completed.\nProcessed: {total}/{total}"
         if file_name:
@@ -4583,6 +4811,8 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
         active_file_id = None
         skip_current_number = False
         stop_requested = False
+        jump_requested_index = None
+        pause_interrupt = False
         pause_event.set()
 
 
@@ -4769,12 +4999,15 @@ async def handle_numbers(message: Message):
         await message.answer("Another processing session is running. Use /stop to stop it first.")
         return
 
-    numbers = parse_numbers(message.text)
+    numbers, ignored = extract_real_numbers(message.text)
     if not numbers:
-        await message.answer("No valid numbers found in message.")
+        text = "No real phone numbers found in the message. Numbers need a country code, with or without +."
+        if ignored:
+            text += "\n" + _ignored_note(ignored)
+        await message.answer(text)
         return
 
-    await offer_batch(message, user_id, numbers)
+    await offer_batch(message, user_id, numbers, header=_ignored_note(ignored, html_mode=True) or None)
 
 
 # ------------------------------------------------------------
@@ -4809,9 +5042,10 @@ async def handle_document(message: Message):
         await message.answer("❌ Couldn't download that file. Please try again.")
         return
 
-    numbers = parse_numbers(text)
+    numbers, ignored = extract_real_numbers(text)
     if not numbers:
-        await message.answer("❌ No numbers found in that file.")
+        note = ("\n" + _ignored_note(ignored)) if ignored else ""
+        await message.answer("❌ No real phone numbers found in that file. Numbers need a country code, with or without +." + note)
         return
 
     saved = await db_add_number_file(user_id, file_name, numbers)
@@ -4822,6 +5056,8 @@ async def handle_document(message: Message):
     add_only = user_data_store.get(user_id, {}).pop('nf_action', None) == 'adding_file'
     kept = (f"✅ <b>{html.escape(saved['name'])}</b> saved: {saved['total']:,} numbers, "
             f"kept for {NUMBER_FILE_TTL_HOURS} hours.")
+    if ignored:
+        kept += "\n" + _ignored_note(ignored, html_mode=True)
 
     if add_only:
         await message.answer(
@@ -5150,11 +5386,18 @@ async def stop_handler(message: Message):
 
 @router.message(Command("pause"))
 async def pause_handler(message: Message):
-    global is_paused
+    global is_paused, pause_interrupt
     if is_processing and not is_paused:
         is_paused = True
         pause_event.clear()
-        await message.answer("Processing paused.")
+        pause_interrupt = True          # the number in flight is abandoned; /resume restarts it from its start
+        device_event.set()              # wake whatever it is waiting for
+        for st in list(live_wscode_state.values()):
+            st["wake"].set()
+        await message.answer(
+            "⏸️ Processing paused. /resume restarts the number you paused on from its start "
+            "(a number already sent to the chat finishes first)."
+        )
     else:
         await message.answer("No active processing session to pause.")
 
@@ -5176,9 +5419,52 @@ async def next_handler(message: Message):
     if is_processing:
         skip_current_number = True
         device_event.set()
+        for st in list(live_wscode_state.values()):
+            st["wake"].set()            # wake a number that is waiting for the chat result
         await message.answer("Skipping current number...")
     else:
         await message.answer("No active processing session.")
+
+
+@router.message(Command("jumpto"))
+async def jumpto_handler(message: Message):
+    global jump_requested_index, skip_current_number
+    if not (is_processing and current_task):
+        await message.answer("No active processing session to jump in.")
+        return
+    if active_file_id is None:
+        await message.answer("/jumpto only works while a file from /numberfiles is being processed.")
+        return
+    total = total_numbers_count
+    usage = f"Usage: /jumpto <number>, from 1 to {total}. You are at number {current_index} of {total}."
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(usage)
+        return
+    try:
+        target = int(parts[1].strip().lstrip("#"))
+    except ValueError:
+        await message.answer(usage)
+        return
+    if not 1 <= target <= total:
+        await message.answer(f"❌ Out of range. Choose a number from 1 to {total}. You are at number {current_index} of {total}.")
+        return
+    if stop_requested:
+        await message.answer("Already stopping...")
+        return
+
+    jump_requested_index = target - 1
+    skip_current_number = True          # abandon the number in flight (same wake-up as /next)
+    device_event.set()
+    for st in list(live_wscode_state.values()):
+        st["wake"].set()
+    if is_paused:
+        text = f"↪️ Jump to number {target} of {total} is set. It starts when the pause ends (or /resume)."
+    elif target == current_index:
+        text = f"↪️ Restarting number {target} of {total}..."
+    else:
+        text = f"↪️ Jumping from number {current_index} to number {target} of {total}..."
+    await message.answer(text)
 
 
 @router.message(Command("stats"))
