@@ -62,7 +62,8 @@ NO_CODE_AFTER_SECONDS = int(os.getenv("NO_CODE_AFTER_SECONDS", "40"))  # tell th
 DEVICE_STATE_WAIT_SECONDS = 300  # ONE shared budget for all waiting on the device, counted from the check
 RETRY_AFTER_SECONDS = int(os.getenv("RETRY_AFTER_SECONDS", "90"))  # silence after the check before type=retry is sent
 RETRY_MAX = int(os.getenv("RETRY_MAX", "2"))  # retries per number (the last one is the last)
-PAUSE_AUTO_RESUME_SECONDS = int(os.getenv("PAUSE_AUTO_RESUME_SECONDS", "300"))  # how long a pause asked by the device lasts
+PAUSE_AUTO_RESUME_SECONDS = int(os.getenv("PAUSE_AUTO_RESUME_SECONDS", "300"))  # how long the pause lasts when the device sends unavailable too many times in a row
+UNAVAILABLE_PAUSE_AFTER = int(os.getenv("UNAVAILABLE_PAUSE_AFTER", "5"))  # consecutive "unavailable" answers from the device that trigger the pause
 # which entries count as real phone numbers: "strict" = international shape AND libphonenumber says valid, "shape" = shape only
 NUMBER_CHECK_MODE = os.getenv("NUMBER_CHECK", "strict").lower()
 RESULT_WAIT_SECONDS = int(os.getenv("RESULT_WAIT_SECONDS", "180"))  # separate wait for the chat result (3 minutes)
@@ -77,6 +78,7 @@ RESULT_PATTERNS = (
     ("ERROR", re.compile(r"error", re.IGNORECASE)),
 )
 NEXT_NUMBER_DELAY_SECONDS = float(os.getenv("NEXT_NUMBER_DELAY_SECONDS", "2"))  # pause between numbers, however the last one ended
+CLEAR_EXTRA_DELAY_SECONDS = float(os.getenv("CLEAR_EXTRA_DELAY_SECONDS", "2"))  # extra wait after type=clear, added to NEXT_NUMBER_DELAY_SECONDS
 
 router = Router()
 bot_instance: Optional[Bot] = None
@@ -3659,7 +3661,7 @@ async def start_handler(message: Message):
         "3) Send numbers as text, or send a .txt file, then pick which OTP group to search (or All Groups). Files are saved while you are logged in, so you can resume them. A file remembers the OTP group you picked; change it from the file's menu in /numberfiles\n"
         "4) If the device requests a code, the bot searches your OTP groups (short backfill + live handlers) "
         f"for the number-derived pattern and sends the OTP it finds to the device. After {NO_CODE_AFTER_SECONDS}s without a code the "
-        "device gets no_code and the search keeps going. blocked / try_again end the number at any point.\n"
+        "device gets no_code and the search keeps going. blocked / unavailable / try_again end the number at any point (unavailable counts as Bad Num).\n"
         f"5) All waiting on the device shares one {DEVICE_STATE_WAIT_SECONDS // 60}-minute budget counted from the check. "
         f"If the device does not answer the check at all, it gets type=retry after {RETRY_AFTER_SECONDS}s and once more "
         f"{RETRY_AFTER_SECONDS}s later; any response from the device stops the retrying for that number. "
@@ -3673,10 +3675,10 @@ async def start_handler(message: Message):
         f"{', '.join(RESULT_KEYWORDS)} (any capitalisation; successful / successfully count as SUCCESS). "
         "SUCCESS shows 🟢 Success, anything else 🟠 Failure. If no code comes back the bot just waits.\n"
         "7) When a number ends on a timeout, or a result is decided (from the chat or from the device), the device is told to clear before the "
-        "next number starts. Bad Num / Try Later / error / skipped are not cleared, and no_code is not an ending.\n"
+        f"next number starts, and the bot waits {CLEAR_EXTRA_DELAY_SECONDS:g}s more than usual before that next number. Bad Num / Try Later / error are not cleared, and no_code is not an ending.\n"
         f"8) Only real phone numbers (with a country code, with or without +) are processed; anything else is ignored. "
-        f"If the device returns pause, the batch holds for {_human_secs(PAUSE_AUTO_RESUME_SECONDS)} and then restarts that same number "
-        "from its start (a pause is not acted on once the number is in the chat). Skipped and jumped-over numbers send clear too. "
+        f"If the device returns unavailable {UNAVAILABLE_PAUSE_AFTER} times in a row, the batch holds for {_human_secs(PAUSE_AUTO_RESUME_SECONDS)} "
+        "(or until /resume) and then carries on with the next number. Skipped and jumped-over numbers send clear too. "
         "A saved file keeps every entry, junk included, and skips the junk when it is reached. Without a target chat ID "
         "nothing is forwarded, but continue / success / failure from the device are still taken."
     )
@@ -4248,17 +4250,17 @@ def _scope_label(otp_set_name: Optional[str]) -> str:
 
 
 def _search_interrupt_from_status() -> Optional[str]:
-    """While searching for a code, blocked / try_again from the device end the number
+    """While searching for a code, blocked / unavailable / try_again from the device end the number
     (it can turn out bad or delayed after the code was requested)."""
     if pause_interrupt:
         return "pause"                  # the user pressed /pause: abandon this number, /resume restarts it
     status = (device_status or "").lower()
     if "blocked" in status:
         return "blocked"
+    if "unavailable" in status:
+        return "unavailable"            # counts as Bad Num (and towards the unavailable-in-a-row pause)
     if "try_again" in status:
         return "try_again"
-    if "pause" in status:
-        return "pause"                  # the device asked for a pause
     return None
 
 
@@ -4282,10 +4284,10 @@ def _device_state_from_status() -> Optional[str]:
     status = (device_status or "").lower()
     if "blocked" in status:
         return "blocked"
+    if "unavailable" in status:
+        return "unavailable"
     if "try_again" in status:
         return "try_again"
-    if "pause" in status:
-        return "pause"
     outcome = _device_outcome_from_status()
     if outcome:
         return outcome                  # success / failure straight from the device, no continue needed
@@ -4298,7 +4300,7 @@ def _device_state_from_status() -> Optional[str]:
 
 async def _wait_device_state(deadline: float) -> str:
     """Waits (inside the 5-minute device state wait) until the device answers.
-    Returns blocked | try_again | success | failure | error | continue | skip | timeout. Other callbacks are ignored."""
+    Returns blocked | unavailable | try_again | success | failure | error | continue | skip | timeout. Other callbacks are ignored."""
     while True:
         _raise_if_stopped()
         state = _device_state_from_status()
@@ -4385,9 +4387,10 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
     Device asked for a code: search, send it, then wait for the device's state before deciding anything.
       continue -> True (go on to the chat check)
       error    -> search again for a new code, all inside the shared 5-minute device budget
-      blocked / try_again at any point -> the number ends here (Bad Num / Try Later)
+      blocked / unavailable / try_again at any point -> the number ends here (blocked / unavailable = Bad Num, try_again = Try Later)
     Returns "continue", "result" (the device itself reported success / failure), "timeout" (the number ended on
-    a timeout), "pause" (the device asked for a pause, or /pause was used: the number restarts later) or "ended".
+    a timeout), "pause" (/pause was used: the number restarts later), "unavailable" (ended as Bad Num because the
+    device said unavailable) or "ended".
     """
     global device_status
     scope_label = _scope_label(otp_set_name)
@@ -4396,10 +4399,18 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
     sent_codes: Set[str] = set()
     duration = min(OTP_SEARCH_DURATION, max(0.0, device_deadline - time.time()))
 
-    async def finish(text: str, status: str, timed_out: bool = False) -> str:
+    async def finish(text: str, status: str, timed_out: bool = False, details: Optional[str] = None,
+                     ret: Optional[str] = None) -> str:
         await num_msg.edit_text(f"{num} {text}")
-        await log_number_status(num, status)
-        return "timeout" if timed_out else ("skipped" if status == "skipped" else "ended")
+        await log_number_status(num, status, details)
+        if timed_out:
+            return "timeout"
+        return ret or ("skipped" if status == "skipped" else "ended")
+
+    async def unavailable() -> str:
+        # the device said unavailable: shown and logged exactly like Bad Num, but reported as "unavailable" so the
+        # batch can count how many came in a row
+        return await finish("⚫ Bad Num", "blocked", details="unavailable", ret="unavailable")
 
     async def paused() -> str:
         await _device_pause_notice(num_msg, num)
@@ -4416,6 +4427,8 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
             return await finish("⏭️ Skipped", "skipped")
         if outcome == "blocked":
             return await finish("⚫ Bad Num", "blocked")
+        if outcome == "unavailable":
+            return await unavailable()
         if outcome == "try_again":
             return await finish("🟡 Try Later", "try_again")
         if outcome == "pause":
@@ -4453,6 +4466,8 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
             return await finish("⏭️ Skipped", "skipped")
         if state == "blocked":
             return await finish("⚫ Bad Num", "blocked")
+        if state == "unavailable":
+            return await unavailable()
         if state == "try_again":
             return await finish("🟡 Try Later", "try_again")
         if state == "pause":
@@ -4473,25 +4488,22 @@ def _human_secs(seconds: float) -> str:
 
 
 async def _device_pause_notice(num_msg, num: str) -> None:
-    if pause_interrupt:
-        await num_msg.edit_text(f"{num} ⏸️ Paused. This number restarts from its start when you /resume.")
-    else:
-        await num_msg.edit_text(f"{num} ⏸️ Device asked to pause. Restarting this number in {_human_secs(PAUSE_AUTO_RESUME_SECONDS)}...")
+    await num_msg.edit_text(f"{num} ⏸️ Paused. This number restarts from its start when you /resume.")
     await log_number_status(num, "paused")
 
 
 async def _device_pause(message: Message, status_msg, idx: int, total: int) -> None:
     """
-    The device asked for a pause: hold the batch for PAUSE_AUTO_RESUME_SECONDS (or until /resume), then the same
-    number is redone from its start.
+    The device sent unavailable UNAVAILABLE_PAUSE_AFTER times in a row: hold the batch for PAUSE_AUTO_RESUME_SECONDS
+    (or until /resume), then carry on with the next number (the unavailable ones already ended as Bad Num).
     """
     global is_paused
     is_paused = True
     pause_event.clear()
     try:
         await status_msg.edit_text(
-            f"⏸️ Paused by the device at number {idx + 1}/{total}. This number restarts from its start in "
-            f"{_human_secs(PAUSE_AUTO_RESUME_SECONDS)} (or use /resume)."
+            f"⏸️ Paused: the device sent unavailable {UNAVAILABLE_PAUSE_AFTER} times in a row (up to number "
+            f"{idx + 1}/{total}). Continuing with number {idx + 2} in {_human_secs(PAUSE_AUTO_RESUME_SECONDS)} (or use /resume)."
         )
     except Exception:
         pass
@@ -4501,7 +4513,7 @@ async def _device_pause(message: Message, status_msg, idx: int, total: int) -> N
         is_paused = False
         pause_event.set()
         try:
-            await message.answer(f"▶️ Pause over. Restarting number {idx + 1}/{total}...")
+            await message.answer(f"▶️ Pause over. Continuing with number {idx + 2}/{total}...")
         except Exception:
             pass
 
@@ -4549,7 +4561,8 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
     Runs one number through device check -> OTP search/send -> no-tag forward -> chat result.
     Returns "timeout", "result" or "skipped" when the device has to be told to clear before the next number
     (the number ended on a timeout, a result was decided, or it was skipped / jumped over), "pause" when the number
-    was abandoned because of a pause (it is restarted later), and None for every other ending.
+    was abandoned because of /pause (it is restarted later), "unavailable" when the device said unavailable (ended
+    as Bad Num, no clear; the batch counts these in a row), and None for every other ending.
     """
     global device_status
     num_msg = await message.answer(f"{num} ⏳ Checking on device...")
@@ -4583,7 +4596,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
 
     result_text = (device_status or "").lower()
 
-    if pause_interrupt or "pause" in result_text:
+    if pause_interrupt:
         await _device_pause_notice(num_msg, num)
         return "pause"
 
@@ -4591,6 +4604,12 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
         await num_msg.edit_text(f"{num} ⚫ Bad Num")
         await log_number_status(num, "blocked")
         return
+
+    if "unavailable" in result_text:
+        # taken as Bad Num (same message, same log status); the batch counts how many came in a row
+        await num_msg.edit_text(f"{num} ⚫ Bad Num")
+        await log_number_status(num, "blocked", "unavailable")
+        return "unavailable"
 
     if "try_again" in result_text:
         await num_msg.edit_text(f"{num} 🟡 Try Later")
@@ -4605,7 +4624,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
     if "request_code" in result_text or "requestcode" in result_text or "request-code" in result_text:
         stage = await _otp_stage(num_msg, user_id, num, otp_set_name, device_deadline)
         if stage != "continue":
-            return stage if stage in ("timeout", "result", "pause", "skipped") else None
+            return stage if stage in ("timeout", "result", "pause", "skipped", "unavailable") else None
     else:
         result_after = (device_status or "").lower()
         if "continue" not in result_after and "continued" not in result_after and "proceed" not in result_after:
@@ -4757,6 +4776,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
     stop_requested = False
     jump_requested_index = None
     pause_interrupt = False
+    unavailable_streak = 0             # numbers in a row that ended because the device said unavailable
     try:
         problem = await _batch_preconditions(user_id)
         if problem:
@@ -4833,29 +4853,30 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
 
             if jump_requested_index is not None:
                 # /jumpto: this number is abandoned and the file carries on from the number that was asked for
+                unavailable_streak = 0
+                clear_sent = False
                 if outcome in ("timeout", "result", "skipped"):
                     if not await call_device_api(num, payload_type="clear"):
                         logger.warning(f"Could not send clear for {num}")
+                    clear_sent = True
                 idx = await _take_jump(file_id)
                 completed = idx
                 in_flight = False
                 _raise_if_stopped()
+                if clear_sent and CLEAR_EXTRA_DELAY_SECONDS > 0:
+                    await asyncio.sleep(CLEAR_EXTRA_DELAY_SECONDS)     # after type=clear: 2s + the normal wait
                 if NEXT_NUMBER_DELAY_SECONDS > 0:
                     await asyncio.sleep(NEXT_NUMBER_DELAY_SECONDS)
                 continue
 
             if outcome == "pause":
-                # paused (by the device, or by /pause): nothing counts as done, the same number is redone from its start
-                manual = pause_interrupt
+                # paused by /pause: nothing counts as done, the same number is redone from its start
                 pause_interrupt = False
-                if manual:
-                    try:
-                        await status_msg.edit_text(f"⏸️ Paused at number {idx + 1}/{total}. /resume restarts this number from its start.")
-                    except Exception:
-                        pass
-                    # /pause already cleared pause_event: the top of the loop waits there until /resume
-                else:
-                    await _device_pause(message, status_msg, idx, total)
+                try:
+                    await status_msg.edit_text(f"⏸️ Paused at number {idx + 1}/{total}. /resume restarts this number from its start.")
+                except Exception:
+                    pass
+                # /pause already cleared pause_event: the top of the loop waits there until /resume
                 continue
 
             completed = idx + 1
@@ -4867,11 +4888,24 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
 
             # a number that ended on a timeout (any of them) or with a result is followed by clear before the
             # next number starts; Bad Num / Try Later / error are not
+            clear_sent = False
             if outcome in ("timeout", "result", "skipped"):
                 if not await call_device_api(num, payload_type="clear"):
                     logger.warning(f"Could not send clear for {num}")
+                clear_sent = True
             _raise_if_stopped()
 
+            # unavailable from the device = Bad Num; UNAVAILABLE_PAUSE_AFTER of them in a row trigger the pause.
+            # Any other ending breaks the run.
+            unavailable_streak = unavailable_streak + 1 if outcome == "unavailable" else 0
+            if unavailable_streak >= UNAVAILABLE_PAUSE_AFTER:
+                unavailable_streak = 0
+                if idx < total - 1 and not is_paused:       # nothing to hold the batch for after the last number
+                    await _device_pause(message, status_msg, idx, total)
+
+            # after type=clear the device gets CLEAR_EXTRA_DELAY_SECONDS on top of the normal wait
+            if idx < total - 1 and clear_sent and CLEAR_EXTRA_DELAY_SECONDS > 0:
+                await asyncio.sleep(CLEAR_EXTRA_DELAY_SECONDS)
             # same short pause after every number, however it ended
             if idx < total - 1 and NEXT_NUMBER_DELAY_SECONDS > 0:
                 await asyncio.sleep(NEXT_NUMBER_DELAY_SECONDS)
