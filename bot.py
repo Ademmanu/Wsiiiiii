@@ -218,12 +218,12 @@ async def _load_target_chats_on_startup():
         return
     try:
         async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT user_id, chat_id FROM bot_settings WHERE chat_id IS NOT NULL")
+            rows = await conn.fetch("SELECT user_id, chat_id FROM bot_settings")
     except Exception:
         logger.exception("Could not load saved target chat ids")
         return
     for row in rows:
-        user_target_chat_ids[int(row["user_id"])] = int(row["chat_id"])
+        user_target_chat_ids[int(row["user_id"])] = int(row["chat_id"]) if row["chat_id"] is not None else None
     logger.info(f"Loaded {len(rows)} saved target chat id(s)")
 
 
@@ -3495,6 +3495,7 @@ async def _load_saved_sessions_on_startup():
 
 
 async def _get_user_target_chat(user_id: int) -> Optional[int]:
+    # an entry (even an explicitly empty one) is final: the global fallback only applies to users with no entry at all
     if user_id in user_target_chat_ids:
         return user_target_chat_ids[user_id]
 
@@ -3502,10 +3503,11 @@ async def _get_user_target_chat(user_id: int) -> Optional[int]:
         return target_chat_id
 
     async with db_pool.acquire() as conn:
-        chat_id = await conn.fetchval("SELECT chat_id FROM bot_settings WHERE user_id = $1", user_id)
-    if chat_id:
-        user_target_chat_ids[user_id] = int(chat_id)
-        return int(chat_id)
+        row = await conn.fetchrow("SELECT chat_id FROM bot_settings WHERE user_id = $1", user_id)
+    if row is not None:
+        chat_id = int(row["chat_id"]) if row["chat_id"] is not None else None
+        user_target_chat_ids[user_id] = chat_id
+        return chat_id
 
     return target_chat_id
 
@@ -3547,7 +3549,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
   /otpgroups - Configure OTP search groups
 
 🎯 **Target Chat:**
-  /setchatid - Set the result chat
+  /setchatid - Set the target chat (asks for the ID)
 
 📂 **Number Files:**
   /numberfiles - Saved .txt batches (kept 48h)
@@ -3644,13 +3646,13 @@ async def start_handler(message: Message):
         "Commands:\n"
         "/login - connect your Telegram account (phone -> code -> 2FA)\n"
         "/logout - disconnect and remove your saved session\n"
-        "/setchatid <chat_id> - set the target chat that receives numbers and reports the result\n"
+        "/setchatid - set the target chat that receives numbers and reports the result (it asks for the ID; send None to leave it empty)\n"
         "/otpgroups - manage OTP search sets (Name = pattern = group IDs)\n"
         "/numberfiles - saved .txt number files (kept 48h, resume where you stopped)\n"
         "/getallid - list the chat IDs of your logged-in account\n"
-        "/pause | /resume | /next | /jumpto <n> | /stats | /stop\n"
-        "/pause holds the batch and /resume restarts the number you paused on. /jumpto <n> jumps to number n of the file "
-        "being processed (1 to the file's total).\n\n"
+        "/pause | /resume | /next | /jumpto | /stats | /stop\n"
+        "/pause holds the batch and /resume restarts the number you paused on. /jumpto asks which number of the file being "
+        "processed to jump to (1 to the file's total). /stop then Resume restarts the number it stopped on.\n\n"
         "How it works:\n"
         "1) /login and complete the interactive login flow\n"
         "2) /otpgroups to add OTP sets, e.g. HK = 2|TGT|3 = -100123456789\n"
@@ -3674,7 +3676,9 @@ async def start_handler(message: Message):
         "next number starts. Bad Num / Try Later / error / skipped are not cleared, and no_code is not an ending.\n"
         f"8) Only real phone numbers (with a country code, with or without +) are processed; anything else is ignored. "
         f"If the device returns pause, the batch holds for {_human_secs(PAUSE_AUTO_RESUME_SECONDS)} and then restarts that same number "
-        "from its start (a pause is not acted on once the number is in the chat)."
+        "from its start (a pause is not acted on once the number is in the chat). Skipped and jumped-over numbers send clear too. "
+        "A saved file keeps every entry, junk included, and skips the junk when it is reached. Without a target chat ID "
+        "nothing is forwarded, but continue / success / failure from the device are still taken."
     )
     await message.answer(help_text)
 
@@ -3703,25 +3707,12 @@ async def otpgroups_cmd_handler(message: Message):
     await otpgroups_command(update, context)
 
 
-@router.message(Command("setchatid"))
-async def setchatid_handler(message: Message):
+async def _set_target_chat(message: Message, user_id: int, chat_id: Optional[int]) -> None:
+    """Stores the target chat (None = empty: nothing is forwarded) in memory and in the database."""
     global target_chat_id
-    user_id = message.from_user.id
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        current = await _get_user_target_chat(user_id)
-        shown = f"`{current}`" if current else "not set"
-        await message.answer(f"Current target chat id: {shown}\nUsage: `/setchatid -100xxxxxxxxxx`", parse_mode="Markdown")
-        return
-
-    try:
-        chat_id = int(args[1])
-    except ValueError:
-        await message.answer("❌ Invalid Chat ID format. Must be an integer.")
-        return
-
     user_target_chat_ids[user_id] = chat_id
-    target_chat_id = chat_id
+    if chat_id is not None:
+        target_chat_id = chat_id
 
     saved = False
     if db_pool:
@@ -3744,7 +3735,13 @@ async def setchatid_handler(message: Message):
     # the SUCCESS/FAILED/BANNED live handler follows the target chat
     await update_result_handler_for_user(user_id)
 
-    if saved:
+    if chat_id is None:
+        text = ("✅ Target chat ID is now empty. Numbers are not forwarded anywhere, but the bot still takes "
+                "continue / success / failure from the device.")
+        if not saved:
+            text += "\n⚠️ It could not be saved to the database, so it will be lost on restart."
+        await message.answer(text)
+    elif saved:
         await message.answer(f"✅ Target chat ID successfully set to `{chat_id}`", parse_mode="Markdown")
     else:
         await message.answer(
@@ -3754,11 +3751,61 @@ async def setchatid_handler(message: Message):
         )
 
 
+def _prompt_cancel_markup(first_row: Optional[list] = None) -> InlineKeyboardMarkup:
+    rows = [first_row] if first_row else []
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="pr_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _setchatid_markup() -> InlineKeyboardMarkup:
+    return _prompt_cancel_markup([InlineKeyboardButton("🆔 Get chat IDs", callback_data="pr_ids")])
+
+
+async def _try_setchatid(message: Message, raw: str, retry: bool = False) -> str:
+    """Applies the answer to the /setchatid prompt ('None' = empty). Returns 'ok' or 'invalid'."""
+    value = (raw or "").strip()
+    user_id = message.from_user.id
+    if value.lower() == "none":
+        await _set_target_chat(message, user_id, None)
+        return "ok"
+    try:
+        chat_id = int(value)
+    except ValueError:
+        await message.answer(
+            "❌ That is not a valid chat ID. Send a number like -1001234567890, or None to leave it empty. "
+            "Tap Get chat IDs if you need to look it up, or Cancel.",
+            reply_markup=_setchatid_markup() if retry else None,
+        )
+        return "invalid"
+    await _set_target_chat(message, user_id, chat_id)
+    return "ok"
+
+
+@router.message(Command("setchatid"))
+async def setchatid_handler(message: Message):
+    user_id = message.from_user.id
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) >= 2:                                  # /setchatid <id> still works as a shortcut
+        await _try_setchatid(message, parts[1])
+        return
+    current = await _get_user_target_chat(user_id)
+    shown = f"<code>{current}</code>" if current else "not set (empty)"
+    user_data_store.setdefault(user_id, {})['prompt'] = {"kind": "setchatid", "ts": time.time()}
+    await message.answer(
+        "🎯 <b>Target chat ID</b>\n\n"
+        f"Current: {shown}\n\n"
+        "Send the chat ID (like <code>-1001234567890</code>), or send <code>None</code> to leave it empty.\n"
+        "Need the ID? Tap <b>Get chat IDs</b> (the same as /getallid), then send the ID here.",
+        parse_mode="HTML",
+        reply_markup=_setchatid_markup(),
+    )
+
+
 # ------------------------------------------------------------
 # Inline buttons (fordet button_handler branches for login / logout /
 # getallid / otpgroups, copied verbatim)
 # ------------------------------------------------------------
-@router.callback_query(~F.data.startswith("nf_"), ~F.data.startswith("otpsel_"))
+@router.callback_query(~F.data.startswith("nf_"), ~F.data.startswith("otpsel_"), ~F.data.startswith("pr_"))
 async def button_handler(callback: CallbackQuery):
     update, context = ptb_from_callback(callback)
     query = update.callback_query
@@ -4100,6 +4147,20 @@ def parse_numbers(text: str) -> List[str]:
     return extract_real_numbers(text)[0]
 
 
+def split_tokens(text: str) -> List[str]:
+    """Every entry of a text, real or not, in order (a saved file keeps all of them so its numbering never shifts)."""
+    return [t.strip() for t in re.split(r"[,\s]+", text or "") if t.strip()]
+
+
+def _junk_note(junk: List[str], real_count: int, html_mode: bool = False) -> str:
+    shown = ", ".join((t if len(t) <= 20 else t[:20] + "…") for t in junk[:5])
+    more = f" (+{len(junk) - 5} more)" if len(junk) > 5 else ""
+    noun = "entry is" if len(junk) == 1 else "entries are"
+    text = (f"ℹ️ {real_count:,} real phone number(s); {len(junk)} {noun} not real and will be skipped when reached "
+            f"(the numbering stays as in your file, so /jumpto matches it): {shown}{more}")
+    return html.escape(text) if html_mode else text
+
+
 def _ignored_note(ignored: List[str], html_mode: bool = False) -> str:
     if not ignored:
         return ""
@@ -4338,7 +4399,7 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
     async def finish(text: str, status: str, timed_out: bool = False) -> str:
         await num_msg.edit_text(f"{num} {text}")
         await log_number_status(num, status)
-        return "timeout" if timed_out else "ended"
+        return "timeout" if timed_out else ("skipped" if status == "skipped" else "ended")
 
     async def paused() -> str:
         await _device_pause_notice(num_msg, num)
@@ -4486,9 +4547,9 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
                          otp_set_name: Optional[str] = None) -> Optional[str]:
     """
     Runs one number through device check -> OTP search/send -> no-tag forward -> chat result.
-    Returns "timeout" or "result" when the device has to be told to clear before the next number
-    (the number ended on a timeout, or a result was seen in the chat), "pause" when the number was abandoned
-    because of a pause (it is restarted later), and None for every other ending.
+    Returns "timeout", "result" or "skipped" when the device has to be told to clear before the next number
+    (the number ended on a timeout, a result was decided, or it was skipped / jumped over), "pause" when the number
+    was abandoned because of a pause (it is restarted later), and None for every other ending.
     """
     global device_status
     num_msg = await message.answer(f"{num} ⏳ Checking on device...")
@@ -4510,7 +4571,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
         if skip_current_number:
             await num_msg.edit_text(f"{num} ⏭️ Skipped")
             await log_number_status(num, "skipped")
-            return
+            return "skipped"
         await num_msg.edit_text(f"{num} 🟠 Ended (Device timeout - 5 mins)")
         await log_number_status(num, "device_timeout")
         return "timeout"
@@ -4518,7 +4579,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
     if skip_current_number:
         await num_msg.edit_text(f"{num} ⏭️ Skipped")
         await log_number_status(num, "skipped")
-        return
+        return "skipped"
 
     result_text = (device_status or "").lower()
 
@@ -4544,7 +4605,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
     if "request_code" in result_text or "requestcode" in result_text or "request-code" in result_text:
         stage = await _otp_stage(num_msg, user_id, num, otp_set_name, device_deadline)
         if stage != "continue":
-            return stage if stage in ("timeout", "result", "pause") else None
+            return stage if stage in ("timeout", "result", "pause", "skipped") else None
     else:
         result_after = (device_status or "").lower()
         if "continue" not in result_after and "continued" not in result_after and "proceed" not in result_after:
@@ -4560,18 +4621,20 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
     if skip_current_number:
         await num_msg.edit_text(f"{num} ⏭️ Skipped")
         await log_number_status(num, "skipped")
-        return None
-    await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting {'/'.join(RESULT_KEYWORDS)}...")
+        return "skipped"
+    if target_chat:
+        await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting {'/'.join(RESULT_KEYWORDS)}...")
+    else:
+        await num_msg.edit_text(
+            f"{num} 🟢 Continued. No forward was done: no target chat ID was set (use /setchatid). "
+            "Waiting for success/failure from the device..."
+        )
 
     early = _device_outcome_from_status()
     if early:
         await num_msg.edit_text(f"{num} 🟢 Success" if early == "success" else f"{num} 🟠 Failure")
         await log_number_status(num, early, "from device")
         return "result"
-
-    if not target_chat:
-        await num_msg.edit_text(f"{num} ⚠️ Target chat ID not set! Use /setchatid.")
-        return
 
     key = (user_id, num)
     ev = asyncio.Event()
@@ -4582,22 +4645,28 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
     live_wscode_state[key] = {"codes": [], "wake": asyncio.Event(), "reply_to": None, "held_incoming": [],
                               "received": 0, "replied": 0}
     try:
-        sent_info: dict = {}
-        _raise_if_stopped()
-        ok, reason = await forward_message_direct(user_id, target_chat, num, sent_info)
-        if not ok:
-            logger.error("Failed to forward to target chat %s (%s)", target_chat, reason)
-            await num_msg.edit_text(f"{num} ❌ Error forwarding to target chat ID.")
-            return
-        sent_id = sent_info.get("message_id")
-        arm_result_waiter(key, sent_id, sent_info.get("sent_date"))
-        arm_wscode(key, sent_id)
+        sent_id = None
+        if target_chat:
+            sent_info: dict = {}
+            _raise_if_stopped()
+            ok, reason = await forward_message_direct(user_id, target_chat, num, sent_info)
+            if not ok:
+                logger.error("Failed to forward to target chat %s (%s)", target_chat, reason)
+                await num_msg.edit_text(f"{num} ❌ Error forwarding to target chat ID.")
+                return None
 
-        result_deadline = time.time() + RESULT_WAIT_SECONDS
+            sent_id = sent_info.get("message_id")
+            arm_result_waiter(key, sent_id, sent_info.get("sent_date"))
+            arm_wscode(key, sent_id)
 
-        # the number is in the chat: ask the device for its code (wscode). If it sends one back it is replied to
-        # the chat's latest message while we keep waiting; if it never does, we simply follow the wait time.
-        await call_device_api(num, payload_type="wscode")
+            result_deadline = time.time() + RESULT_WAIT_SECONDS
+
+            # the number is in the chat: ask the device for its code (wscode). If it sends one back it is replied to
+            # the chat's latest message while we keep waiting; if it never does, we simply follow the wait time.
+            await call_device_api(num, payload_type="wscode")
+        else:
+            # no target chat: nothing is forwarded, but success / failure from the device still ends the number
+            result_deadline = time.time() + RESULT_WAIT_SECONDS
 
         # live handler only (new AND edited messages), like fordet: the chat is never polled
         got_result = False
@@ -4611,12 +4680,13 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
             device_outcome = _device_outcome_from_status()   # success / failure straight from the device
             if device_outcome:
                 break
-            if skip_current_number:          # /next while waiting for the result
+            if skip_current_number:          # /next (or /jumpto) while waiting for the result
                 skipped = True
                 break
             if result_deadline - time.time() <= 0:
                 break
-            await _flush_wscodes(user_id, target_chat, key)
+            if target_chat:
+                await _flush_wscodes(user_id, target_chat, key)
             if ev.is_set():
                 got_result = True
                 break
@@ -4640,7 +4710,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
         if skipped:
             await num_msg.edit_text(f"{num} ⏭️ Skipped")
             await log_number_status(num, "skipped")
-            return None
+            return "skipped"
 
         if got_result:
             decision = live_success_failure_results.get(key, "UNKNOWN")
@@ -4651,10 +4721,16 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
             await log_number_status(num, decision.lower())
             return "result"
 
-        await num_msg.edit_text(
-            f"{num} 🟠 Live decision timeout (No {'/'.join(RESULT_KEYWORDS)} received)"
-            f"{_chat_seen_summary(user_id, sent_id)}{_wscode_summary(key)}"
-        )
+        if target_chat:
+            await num_msg.edit_text(
+                f"{num} 🟠 Live decision timeout (No {'/'.join(RESULT_KEYWORDS)} received)"
+                f"{_chat_seen_summary(user_id, sent_id)}{_wscode_summary(key)}"
+            )
+        else:
+            await num_msg.edit_text(
+                f"{num} 🟠 Timeout: no success/failure came from the device, and no target chat ID was set "
+                "so nothing was forwarded (use /setchatid)."
+            )
         await log_number_status(num, "decision_timeout")
         return "timeout"
     finally:
@@ -4677,6 +4753,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
 
     total = len(numbers)
     completed = start_index
+    in_flight = False                  # a number has been started and is not finished yet
     stop_requested = False
     jump_requested_index = None
     pause_interrupt = False
@@ -4689,9 +4766,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             await message.answer(text, parse_mode=parse_mode)
             return
 
-        target_chat = await _get_user_target_chat(user_id)
-        if target_chat is None:
-            target_chat = target_chat_id
+        target_chat = await _get_user_target_chat(user_id)      # None = empty: nothing is forwarded
 
         # make sure the live SUCCESS/FAILED handler is watching the current target chat
         if target_chat and result_live_handler_chat.get(user_id) != target_chat:
@@ -4720,34 +4795,50 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             if jump_requested_index is not None:          # a /jumpto that arrived between two numbers
                 idx = await _take_jump(file_id)
                 completed = idx
+                in_flight = False
                 continue
             num = numbers[idx]
             current_index = idx + 1
             active_number = num
             skip_current_number = False
+            in_flight = True
 
             await pause_event.wait()
             pause_interrupt = False                        # a /pause pressed from here on abandons THIS number
             _raise_if_stopped()
             if jump_requested_index is not None:          # a /jumpto while paused: applied at the top of the loop
                 continue
+            if not is_real_number(num):
+                # an entry that is not a real phone number: skipped at once (no device, no clear, no wait). A run of
+                # them is reported in ONE message and the position moves past all of them, so the numbering of the
+                # file (and /jumpto) never shifts.
+                j = idx
+                while j < total and not is_real_number(numbers[j]):
+                    j += 1
+                junk = numbers[idx:j]
+                shown = ", ".join((t if len(t) <= 20 else t[:20] + "…") for t in junk[:5]) + (f" (+{len(junk) - 5} more)" if len(junk) > 5 else "")
+                span = f"number {idx + 1}" if len(junk) == 1 else f"numbers {idx + 1}-{j}"
+                await message.answer(f"⚪ Skipped {span}: not a real phone number ({shown})")
+                for entry in junk:
+                    await log_number_status(entry, "invalid_number")
+                idx = j
+                completed = j
+                in_flight = False
+                if file_id is not None:
+                    await db_set_file_progress(file_id, completed)
+                continue
             await status_msg.edit_text(f"Processing batch\n\nProgress: {idx + 1}/{total}\nTarget: {num}")
 
-            if is_real_number(num):
-                outcome = await process_number(message, user_id, target_chat, num, otp_set_name)
-            else:
-                # (files saved before only real numbers were accepted)
-                await message.answer(f"{num} ⚪ Ignored (not a real phone number)")
-                await log_number_status(num, "invalid_number")
-                outcome = None
+            outcome = await process_number(message, user_id, target_chat, num, otp_set_name)
 
             if jump_requested_index is not None:
                 # /jumpto: this number is abandoned and the file carries on from the number that was asked for
-                if outcome in ("timeout", "result"):
+                if outcome in ("timeout", "result", "skipped"):
                     if not await call_device_api(num, payload_type="clear"):
                         logger.warning(f"Could not send clear for {num}")
                 idx = await _take_jump(file_id)
                 completed = idx
+                in_flight = False
                 _raise_if_stopped()
                 if NEXT_NUMBER_DELAY_SECONDS > 0:
                     await asyncio.sleep(NEXT_NUMBER_DELAY_SECONDS)
@@ -4768,14 +4859,15 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
                 continue
 
             completed = idx + 1
+            in_flight = False
             if file_id is not None:
                 await db_set_file_progress(file_id, completed)
 
             _raise_if_stopped()
 
             # a number that ended on a timeout (any of them) or with a result is followed by clear before the
-            # next number starts; Bad Num / Try Later / error / skipped are not
-            if outcome in ("timeout", "result"):
+            # next number starts; Bad Num / Try Later / error are not
+            if outcome in ("timeout", "result", "skipped"):
                 if not await call_device_api(num, payload_type="clear"):
                     logger.warning(f"Could not send clear for {num}")
             _raise_if_stopped()
@@ -4794,7 +4886,10 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
         logger.info("Batch stopped by user request.")
         if file_id is not None:
             try:
-                await message.answer(f"⏹️ Stopped at {completed}/{total}. Open /numberfiles to resume {file_name}.")
+                if in_flight:
+                    await message.answer(f"⏹️ Stopped on number {completed + 1}/{total}. Resume restarts it from its start (/numberfiles, {file_name}).")
+                else:
+                    await message.answer(f"⏹️ Stopped after number {completed}/{total}. Resume continues with number {completed + 1} (/numberfiles, {file_name}).")
             except Exception:
                 pass
     except Exception:
@@ -4990,10 +5085,58 @@ async def otpsel_callback_handler(callback: CallbackQuery):
         pass
 
 
+PROMPT_TTL = 300  # seconds an unanswered /jumpto or /setchatid prompt stays open
+
+
+def _prompt_active(message: Message) -> bool:
+    if not message.from_user:
+        return False
+    st = user_data_store.get(message.from_user.id, {}).get('prompt')
+    if not st or time.time() - st['ts'] > PROMPT_TTL:
+        return False
+    return len((message.text or "").split()) == 1       # a pasted list is never an answer
+
+
+@router.message(_TEXT_ONLY, _prompt_active)
+async def prompt_text_handler(message: Message):
+    """The answer to a /jumpto or /setchatid prompt."""
+    user_id = message.from_user.id
+    kind = user_data_store[user_id]['prompt']['kind']
+    if kind == "jumpto":
+        result = await _try_jump(message, message.text, retry=True)
+        done = result != "invalid"
+    else:
+        result = await _try_setchatid(message, message.text, retry=True)
+        done = result == "ok"
+    if done:
+        user_data_store.get(user_id, {}).pop('prompt', None)
+
+
+@router.callback_query(F.data.startswith("pr_"))
+async def prompt_callback_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if callback.data == "pr_cancel":
+        user_data_store.get(user_id, {}).pop('prompt', None)
+        await callback.answer()
+        try:
+            await callback.message.edit_text("❎ Cancelled. Nothing was changed.")
+        except Exception:
+            pass
+    elif callback.data == "pr_ids":
+        await callback.answer()
+        # /getallid answers through update.message, so give it the chat of the prompt and the real user
+        update = PTBUpdate(message=callback.message)
+        update.effective_user = callback.from_user
+        await getallid_command(update, PTBContext(user_id))
+    else:
+        await callback.answer()
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_numbers(message: Message):
     user_id = message.from_user.id
     user_data_store.get(user_id, {}).pop('nf_action', None)
+    user_data_store.get(user_id, {}).pop('prompt', None)
 
     if is_processing:
         await message.answer("Another processing session is running. Use /stop to stop it first.")
@@ -5042,8 +5185,11 @@ async def handle_document(message: Message):
         await message.answer("❌ Couldn't download that file. Please try again.")
         return
 
-    numbers, ignored = extract_real_numbers(text)
-    if not numbers:
+    numbers = split_tokens(text)                         # everything is saved, junk included
+    real_flags = [is_real_number(tk) for tk in numbers]
+    real_count = sum(real_flags)
+    ignored = [tk for tk, is_real in zip(numbers, real_flags) if not is_real]
+    if real_count == 0:
         note = ("\n" + _ignored_note(ignored)) if ignored else ""
         await message.answer("❌ No real phone numbers found in that file. Numbers need a country code, with or without +." + note)
         return
@@ -5054,10 +5200,10 @@ async def handle_document(message: Message):
         return
 
     add_only = user_data_store.get(user_id, {}).pop('nf_action', None) == 'adding_file'
-    kept = (f"✅ <b>{html.escape(saved['name'])}</b> saved: {saved['total']:,} numbers, "
+    kept = (f"✅ <b>{html.escape(saved['name'])}</b> saved: {saved['total']:,} entries, "
             f"kept for {NUMBER_FILE_TTL_HOURS} hours.")
     if ignored:
-        kept += "\n" + _ignored_note(ignored, html_mode=True)
+        kept += "\n" + _junk_note(ignored, real_count, html_mode=True)
 
     if add_only:
         await message.answer(
@@ -5426,32 +5572,37 @@ async def next_handler(message: Message):
         await message.answer("No active processing session.")
 
 
-@router.message(Command("jumpto"))
-async def jumpto_handler(message: Message):
-    global jump_requested_index, skip_current_number
+async def _jump_gate(message: Message) -> bool:
+    """True when a /jumpto makes sense right now (a file is being processed); otherwise says why."""
     if not (is_processing and current_task):
         await message.answer("No active processing session to jump in.")
-        return
+        return False
     if active_file_id is None:
         await message.answer("/jumpto only works while a file from /numberfiles is being processed.")
-        return
+        return False
+    return True
+
+
+async def _try_jump(message: Message, raw: str, retry: bool = False) -> str:
+    """Applies a jump target. Returns 'ok', 'invalid' (ask again) or 'gone' (nothing to jump in any more)."""
+    global jump_requested_index, skip_current_number
+    if not await _jump_gate(message):
+        return "gone"
     total = total_numbers_count
-    usage = f"Usage: /jumpto <number>, from 1 to {total}. You are at number {current_index} of {total}."
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer(usage)
-        return
+    markup = _prompt_cancel_markup() if retry else None
     try:
-        target = int(parts[1].strip().lstrip("#"))
+        target = int((raw or "").strip().lstrip("#"))
     except ValueError:
-        await message.answer(usage)
-        return
+        await message.answer(f"❌ That is not a number. Send a number from 1 to {total}. You are at number {current_index} of {total}.",
+                             reply_markup=markup)
+        return "invalid"
     if not 1 <= target <= total:
-        await message.answer(f"❌ Out of range. Choose a number from 1 to {total}. You are at number {current_index} of {total}.")
-        return
+        await message.answer(f"❌ Out of range. Choose a number from 1 to {total}. You are at number {current_index} of {total}.",
+                             reply_markup=markup)
+        return "invalid"
     if stop_requested:
         await message.answer("Already stopping...")
-        return
+        return "gone"
 
     jump_requested_index = target - 1
     skip_current_number = True          # abandon the number in flight (same wake-up as /next)
@@ -5465,6 +5616,26 @@ async def jumpto_handler(message: Message):
     else:
         text = f"↪️ Jumping from number {current_index} to number {target} of {total}..."
     await message.answer(text)
+    return "ok"
+
+
+@router.message(Command("jumpto"))
+async def jumpto_handler(message: Message):
+    if not await _jump_gate(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) >= 2:                                  # /jumpto <n> still works as a shortcut
+        await _try_jump(message, parts[1])
+        return
+    total = total_numbers_count
+    user_data_store.setdefault(message.from_user.id, {})['prompt'] = {"kind": "jumpto", "ts": time.time()}
+    await message.answer(
+        "↪️ <b>Jump to a number</b>\n\n"
+        f"You are at number {current_index} of {total}.\n"
+        f"Send the number to jump to (1 - {total}).",
+        parse_mode="HTML",
+        reply_markup=_prompt_cancel_markup(),
+    )
 
 
 @router.message(Command("stats"))
