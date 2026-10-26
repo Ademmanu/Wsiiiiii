@@ -63,7 +63,7 @@ DEVICE_STATE_WAIT_SECONDS = 300  # ONE shared budget for all waiting on the devi
 RETRY_AFTER_SECONDS = int(os.getenv("RETRY_AFTER_SECONDS", "90"))  # silence after the check before type=retry is sent
 RETRY_MAX = int(os.getenv("RETRY_MAX", "2"))  # retries per number (the last one is the last)
 PAUSE_AUTO_RESUME_SECONDS = int(os.getenv("PAUSE_AUTO_RESUME_SECONDS", "300"))  # how long the pause lasts when the device sends unavailable too many times in a row
-UNAVAILABLE_PAUSE_AFTER = int(os.getenv("UNAVAILABLE_PAUSE_AFTER", "5"))  # consecutive "unavailable" answers from the device that trigger the pause
+UNAVAILABLE_PAUSE_AFTER = int(os.getenv("UNAVAILABLE_PAUSE_AFTER", "4"))  # consecutive "unavailable" answers from the device that trigger the pause
 # which entries count as real phone numbers: "strict" = international shape AND libphonenumber says valid, "shape" = shape only
 NUMBER_CHECK_MODE = os.getenv("NUMBER_CHECK", "strict").lower()
 RESULT_WAIT_SECONDS = int(os.getenv("RESULT_WAIT_SECONDS", "180"))  # separate wait for the chat result (3 minutes)
@@ -4501,12 +4501,13 @@ async def _device_pause(message: Message, status_msg, idx: int, total: int) -> N
     is_paused = True
     pause_event.clear()
     try:
-        await status_msg.edit_text(
+        # a new message (not an edit of the old status message, which is far up the chat by now) so the pause is seen
+        await message.answer(
             f"⏸️ Paused: the device sent unavailable {UNAVAILABLE_PAUSE_AFTER} times in a row (up to number "
             f"{idx + 1}/{total}). Continuing with number {idx + 2} in {_human_secs(PAUSE_AUTO_RESUME_SECONDS)} (or use /resume)."
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(f"Could not send the unavailable-pause notice: {exc}")
     resumed_by_user = await _wait_event(pause_event, PAUSE_AUTO_RESUME_SECONDS)
     _raise_if_stopped()
     if not resumed_by_user:
@@ -4514,8 +4515,8 @@ async def _device_pause(message: Message, status_msg, idx: int, total: int) -> N
         pause_event.set()
         try:
             await message.answer(f"▶️ Pause over. Continuing with number {idx + 2}/{total}...")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"Could not send the pause-over notice: {exc}")
 
 
 async def _take_jump(file_id: Optional[int]) -> int:
