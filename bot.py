@@ -58,7 +58,7 @@ MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(5 * 1024 * 1024)))
 FILES_PER_PAGE = 10
 OTP_PICK_PER_PAGE = 10
 PENDING_BATCH_TTL = 600  # seconds a picked-but-unstarted batch stays valid (10 minutes)
-NO_CODE_AFTER_SECONDS = int(os.getenv("NO_CODE_AFTER_SECONDS", "40"))  # tell the device "no_code" after this long without a code
+NO_CODE_AFTER_SECONDS = int(os.getenv("NO_CODE_AFTER_SECONDS", "50"))  # tell the device "no_code" after this long without a code
 DEVICE_STATE_WAIT_SECONDS = 300  # ONE shared budget for all waiting on the device, counted from the check
 RETRY_AFTER_SECONDS = int(os.getenv("RETRY_AFTER_SECONDS", "90"))  # silence after the check before type=retry is sent
 RETRY_MAX = int(os.getenv("RETRY_MAX", "2"))  # retries per number (the last one is the last)
@@ -78,7 +78,7 @@ RESULT_PATTERNS = (
     ("ERROR", re.compile(r"error", re.IGNORECASE)),
 )
 NEXT_NUMBER_DELAY_SECONDS = float(os.getenv("NEXT_NUMBER_DELAY_SECONDS", "2"))  # pause between numbers, however the last one ended
-CLEAR_EXTRA_DELAY_SECONDS = float(os.getenv("CLEAR_EXTRA_DELAY_SECONDS", "2"))  # extra wait after type=clear, added to NEXT_NUMBER_DELAY_SECONDS
+CLEAR_EXTRA_DELAY_SECONDS = float(os.getenv("CLEAR_EXTRA_DELAY_SECONDS", "1"))  # extra wait after type=clear, added to NEXT_NUMBER_DELAY_SECONDS
 
 router = Router()
 bot_instance: Optional[Bot] = None
