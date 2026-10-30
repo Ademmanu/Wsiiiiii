@@ -41,8 +41,8 @@ MACRODROID_WEBHOOK_URL = os.getenv(
     "MACRODROID_WEBHOOK_URL",
     "http://trigger.macrodroid.com/YOUR_UNIQUE_DEVICE_UUID/telegram_bot",
 )
-# second webhook: once the device answers a number with a status ending in _1 (e.g. continue_1), that number's
-# remaining webhook calls go here instead. Empty = keep using MACRODROID_WEBHOOK_URL.
+# second device's webhook: when the device sends the "switch" status, the current number restarts from type=check on
+# the other device (this URL), and every later webhook call for that number goes there. Empty = switching is off.
 MACRODROID_WEBHOOK_URL_1 = os.getenv("MACRODROID_WEBHOOK_URL_1", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/dbname")
 PORT = int(os.getenv("PORT", "10000"))
@@ -107,7 +107,7 @@ active_number: Optional[str] = None
 
 device_event = asyncio.Event()
 device_status: Optional[str] = None
-use_second_url = False  # set when a device status ends in _1; reset when the next number starts
+use_second_url = False  # True while the number is on the second device; every new number starts on the normal one
 
 skip_current_number = False
 stop_requested = False  # set by /stop; every wait in the number flow checks it
@@ -272,14 +272,13 @@ def parse_phone_number(raw_number: str):
 async def call_device_api(raw_number: str, payload_type: str = "check", code: str | None = None):
     country_code, national_number = parse_phone_number(raw_number)
 
-    # a number that got a _1 status from the device keeps talking to the second webhook until it ends
-    # (type=check and type=retry are only sent before the device has answered, so they always use the normal URL)
+    # every call of a number goes to the device the number is on: the normal one until a "switch" status moves it
     base_url = MACRODROID_WEBHOOK_URL
-    if use_second_url and payload_type not in ("check", "retry"):
+    if use_second_url:
         if MACRODROID_WEBHOOK_URL_1:
             base_url = MACRODROID_WEBHOOK_URL_1
         else:
-            logger.warning("Device status ended in _1 but MACRODROID_WEBHOOK_URL_1 is not set; using the normal URL")
+            logger.warning("Number is on the second device but MACRODROID_WEBHOOK_URL_1 is not set; using the normal URL")
 
     url = (
         f"{base_url}"
@@ -288,7 +287,7 @@ async def call_device_api(raw_number: str, payload_type: str = "check", code: st
     if code:
         url += f"&code={code}"
 
-    logger.info("Triggering MacroDroid%s -> +%s %s [%s]", " (_1)" if base_url != MACRODROID_WEBHOOK_URL else "",
+    logger.info("Triggering MacroDroid%s -> +%s %s [%s]", " (second device)" if base_url != MACRODROID_WEBHOOK_URL else "",
                 country_code, national_number, payload_type)
     try:
         async with aiohttp.ClientSession() as session:
@@ -3675,7 +3674,7 @@ async def start_handler(message: Message):
         "3) Send numbers as text, or send a .txt file, then pick which OTP group to search (or All Groups). Files are saved while you are logged in, so you can resume them. A file remembers the OTP group you picked; change it from the file's menu in /numberfiles\n"
         "4) If the device requests a code, the bot searches your OTP groups (short backfill + live handlers) "
         f"for the number-derived pattern and sends the OTP it finds to the device. After {NO_CODE_AFTER_SECONDS}s without a code the "
-        "device gets no_code and the search keeps going. blocked / unavailable / try_again end the number at any point (unavailable is handled like Bad Num but shown as 🟤 Unavailable). A device status ending in _1 (e.g. continue_1) works like the plain status, and the rest of that number's webhook calls go to MACRODROID_WEBHOOK_URL_1; the next number starts on the normal URL again.\n"
+        "device gets no_code and the search keeps going. blocked / unavailable / try_again end the number at any point (unavailable is handled like Bad Num but shown as 🟤 Unavailable). If the device sends switch (before it has continued), that number restarts from type=check on the other device (MACRODROID_WEBHOOK_URL_1), with fresh timers, and all its calls go there; every new number starts on the normal device.\n"
         f"5) All waiting on the device shares one {DEVICE_STATE_WAIT_SECONDS // 60}-minute budget counted from the check. "
         f"If the device does not answer the check at all, it gets type=retry after {RETRY_AFTER_SECONDS}s and once more "
         f"{RETRY_AFTER_SECONDS}s later; any response from the device stops the retrying for that number. "
@@ -4263,12 +4262,19 @@ def _scope_label(otp_set_name: Optional[str]) -> str:
     return otp_set_name if otp_set_name else "All Groups"
 
 
+def _switch_requested(status: str) -> bool:
+    """The device asked to move this number to the other device (only possible with a second webhook set)."""
+    return "switch" in status and bool(MACRODROID_WEBHOOK_URL_1)
+
+
 def _search_interrupt_from_status() -> Optional[str]:
     """While searching for a code, blocked / unavailable / try_again from the device end the number
-    (it can turn out bad or delayed after the code was requested)."""
+    (it can turn out bad or delayed after the code was requested), and switch restarts it on the other device."""
     if pause_interrupt:
         return "pause"                  # the user pressed /pause: abandon this number, /resume restarts it
     status = (device_status or "").lower()
+    if _switch_requested(status):
+        return "switch"
     if "blocked" in status:
         return "blocked"
     if "unavailable" in status:
@@ -4296,6 +4302,8 @@ def _device_state_from_status() -> Optional[str]:
     if pause_interrupt:
         return "pause"
     status = (device_status or "").lower()
+    if _switch_requested(status):
+        return "switch"
     if "blocked" in status:
         return "blocked"
     if "unavailable" in status:
@@ -4314,7 +4322,7 @@ def _device_state_from_status() -> Optional[str]:
 
 async def _wait_device_state(deadline: float) -> str:
     """Waits (inside the 5-minute device state wait) until the device answers.
-    Returns blocked | unavailable | try_again | success | failure | error | continue | skip | timeout. Other callbacks are ignored."""
+    Returns switch | blocked | unavailable | try_again | success | failure | error | continue | skip | timeout. Other callbacks are ignored."""
     while True:
         _raise_if_stopped()
         state = _device_state_from_status()
@@ -4335,7 +4343,7 @@ async def _search_for_otp(num_msg, user_id: int, num: str, otp_set_name: Optiona
     One OTP search. Keeps going until a code is found, the device says blocked / try_again,
     /next, /stop or the time is up. After NO_CODE_AFTER_SECONDS without a code the device is told
     "no_code" once, and the search keeps running. Any other device callback only re-arms the wait.
-    Returns {"outcome": found | blocked | try_again | skip | none | nopattern, ...}.
+    Returns {"outcome": found | switch | blocked | unavailable | try_again | skip | none | nopattern, ...}.
     """
     global device_status
     scope_label = _scope_label(otp_set_name)
@@ -4403,8 +4411,9 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
       error    -> search again for a new code, all inside the shared 5-minute device budget
       blocked / unavailable / try_again at any point -> the number ends here (blocked / unavailable = Bad Num, try_again = Try Later)
     Returns "continue", "result" (the device itself reported success / failure), "timeout" (the number ended on
-    a timeout), "pause" (/pause was used: the number restarts later), "unavailable" (ended as Bad Num because the
-    device said unavailable) or "ended".
+    a timeout), "pause" (/pause was used: the number restarts later), "switch" (the device asked to move the number
+    to the other device: it restarts from type=check there), "unavailable" (ended as Bad Num because the device said
+    unavailable) or "ended".
     """
     global device_status
     scope_label = _scope_label(otp_set_name)
@@ -4430,6 +4439,10 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
         await _device_pause_notice(num_msg, num)
         return "pause"
 
+    async def switched() -> str:
+        await _device_switch_notice(num_msg, num)
+        return "switch"
+
     if device_deadline - time.time() <= 0:
         return await finish("🟠 Ended (Device timeout - 5 mins)", "device_timeout", timed_out=True)
 
@@ -4439,6 +4452,8 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
 
         if outcome == "skip":
             return await finish("⏭️ Skipped", "skipped")
+        if outcome == "switch":
+            return await switched()
         if outcome == "blocked":
             return await finish("⚫ Bad Num", "blocked")
         if outcome == "unavailable":
@@ -4478,6 +4493,8 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
             return "result"
         if state == "skip":
             return await finish("⏭️ Skipped", "skipped")
+        if state == "switch":
+            return await switched()
         if state == "blocked":
             return await finish("⚫ Bad Num", "blocked")
         if state == "unavailable":
@@ -4504,6 +4521,11 @@ def _human_secs(seconds: float) -> str:
 async def _device_pause_notice(num_msg, num: str) -> None:
     await num_msg.edit_text(f"{num} ⏸️ Paused. This number restarts from its start when you /resume.")
     await log_number_status(num, "paused")
+
+
+async def _device_switch_notice(num_msg, num: str) -> None:
+    await num_msg.edit_text(f"{num} 🟣 Switched")
+    await log_number_status(num, "switch")
 
 
 async def _device_pause(message: Message, status_msg, idx: int, total: int) -> None:
@@ -4570,22 +4592,23 @@ async def _wait_first_device_answer(num_msg, num: str, check_sent_at: float, dea
             window_start = time.time()      # the next 90s of silence are counted from this retry
 
 
-async def process_number(message: Message, user_id: int, target_chat: Optional[int], num: str,
-                         otp_set_name: Optional[str] = None) -> Optional[str]:
+async def _process_number_once(message: Message, user_id: int, target_chat: Optional[int], num: str,
+                               otp_set_name: Optional[str] = None) -> Optional[str]:
     """
-    Runs one number through device check -> OTP search/send -> no-tag forward -> chat result.
+    Runs one number through device check -> OTP search/send -> no-tag forward -> chat result, on the device the
+    number is currently on.
     Returns "timeout", "result" or "skipped" when the device has to be told to clear before the next number
     (the number ended on a timeout, a result was decided, or it was skipped / jumped over), "pause" when the number
-    was abandoned because of /pause (it is restarted later), "unavailable" when the device said unavailable (ended
+    was abandoned because of /pause (it is restarted later), "switch" when the device asked to move the number to
+    the other device (process_number restarts it there), "unavailable" when the device said unavailable (ended
     as Bad Num, no clear; the batch counts these in a row), and None for every other ending.
     """
-    global device_status, use_second_url
+    global device_status
     num_msg = await message.answer(f"{num} ⏳ Checking on device...")
 
     device_event.clear()
     device_status = None
-    use_second_url = False          # every new number starts on the normal webhook
-    check_sent_at = time.time()
+    check_sent_at = time.time()      # the timers (retry, no_code, the 5-minute device budget) all start from here
     device_deadline = check_sent_at + DEVICE_STATE_WAIT_SECONDS   # one shared budget for all waiting on the device
 
     success = await call_device_api(num, payload_type="check")
@@ -4616,6 +4639,10 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
         await _device_pause_notice(num_msg, num)
         return "pause"
 
+    if _switch_requested(result_text):
+        await _device_switch_notice(num_msg, num)
+        return "switch"
+
     if "blocked" in result_text:
         await num_msg.edit_text(f"{num} ⚫ Bad Num")
         await log_number_status(num, "blocked")
@@ -4640,7 +4667,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
     if "request_code" in result_text or "requestcode" in result_text or "request-code" in result_text:
         stage = await _otp_stage(num_msg, user_id, num, otp_set_name, device_deadline)
         if stage != "continue":
-            return stage if stage in ("timeout", "result", "pause", "skipped", "unavailable") else None
+            return stage if stage in ("timeout", "result", "pause", "skipped", "unavailable", "switch") else None
     else:
         result_after = (device_status or "").lower()
         if "continue" not in result_after and "continued" not in result_after and "proceed" not in result_after:
@@ -4773,6 +4800,26 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
         live_success_failure_results.pop(key, None)
         live_success_failure_state.pop(key, None)
         live_wscode_state.pop(key, None)
+
+
+async def process_number(message: Message, user_id: int, target_chat: Optional[int], num: str,
+                         otp_set_name: Optional[str] = None) -> Optional[str]:
+    """
+    A number always starts on the normal device. When the device sends the "switch" status (during the device
+    check, the code search, or while waiting for its answer to the code) the number restarts from the very
+    beginning on the other device: a fresh type=check, fresh timers, as if it had just started. Every call for the
+    number goes to the device it is on, so the final clear also reaches that device. Another switch moves it back.
+    """
+    global use_second_url
+    use_second_url = False
+    while True:
+        outcome = await _process_number_once(message, user_id, target_chat, num, otp_set_name)
+        if outcome != "switch":
+            return outcome
+        if skip_current_number:
+            return "skipped"
+        use_second_url = not use_second_url
+        logger.info("Switching %s to the %s device", num, "second" if use_second_url else "normal")
 
 
 async def run_batch(message: Message, user_id: int, numbers: List[str],
@@ -5700,20 +5747,9 @@ async def handle_health_check(request):
     return web.Response(text="Bot is running live!")
 
 
-def _split_second_url_marker(status: str) -> Tuple[str, bool]:
-    """'blocked_1' -> ('blocked', True). Only a trailing _1 counts; the rest of the bot sees the plain status."""
-    status = status.strip()
-    if status.lower().endswith("_1"):
-        return (status[:-2] or "unknown"), True
-    return status, False
-
-
 async def handle_device_callback(request):
-    global device_status, device_event, use_second_url
-    raw_status = request.query.get("status", "unknown")
-    status, second = _split_second_url_marker(raw_status)
-    if second:
-        use_second_url = True       # this number's remaining webhook calls go to MACRODROID_WEBHOOK_URL_1
+    global device_status, device_event
+    status = request.query.get("status", "unknown")
 
     # the code the device saved in its `wscode` variable:  /device_callback?wscode=123456
     # (or  /device_callback?status=wscode&code=123456 )
@@ -5726,7 +5762,9 @@ async def handle_device_callback(request):
         # a wscode never touches device_status / device_event, so it can't be mistaken for a status answer
         return web.Response(text="wscode received" if accepted else "wscode ignored (no number is waiting for a code)")
 
-    logger.info("Received device callback -> %s", raw_status)
+    logger.info("Received device callback -> %s", status)
+    if "switch" in status.lower() and not MACRODROID_WEBHOOK_URL_1:
+        logger.warning("Device sent switch but MACRODROID_WEBHOOK_URL_1 is not set: ignoring it")
     device_status = status
     device_event.set()
     return web.Response(text="Callback received successfully")
