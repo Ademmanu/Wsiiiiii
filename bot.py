@@ -41,6 +41,9 @@ MACRODROID_WEBHOOK_URL = os.getenv(
     "MACRODROID_WEBHOOK_URL",
     "http://trigger.macrodroid.com/YOUR_UNIQUE_DEVICE_UUID/telegram_bot",
 )
+# second webhook: once the device answers a number with a status ending in _1 (e.g. continue_1), that number's
+# remaining webhook calls go here instead. Empty = keep using MACRODROID_WEBHOOK_URL.
+MACRODROID_WEBHOOK_URL_1 = os.getenv("MACRODROID_WEBHOOK_URL_1", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/dbname")
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -104,6 +107,7 @@ active_number: Optional[str] = None
 
 device_event = asyncio.Event()
 device_status: Optional[str] = None
+use_second_url = False  # set when a device status ends in _1; reset when the next number starts
 
 skip_current_number = False
 stop_requested = False  # set by /stop; every wait in the number flow checks it
@@ -268,14 +272,24 @@ def parse_phone_number(raw_number: str):
 async def call_device_api(raw_number: str, payload_type: str = "check", code: str | None = None):
     country_code, national_number = parse_phone_number(raw_number)
 
+    # a number that got a _1 status from the device keeps talking to the second webhook until it ends
+    # (type=check and type=retry are only sent before the device has answered, so they always use the normal URL)
+    base_url = MACRODROID_WEBHOOK_URL
+    if use_second_url and payload_type not in ("check", "retry"):
+        if MACRODROID_WEBHOOK_URL_1:
+            base_url = MACRODROID_WEBHOOK_URL_1
+        else:
+            logger.warning("Device status ended in _1 but MACRODROID_WEBHOOK_URL_1 is not set; using the normal URL")
+
     url = (
-        f"{MACRODROID_WEBHOOK_URL}"
+        f"{base_url}"
         f"?country_code={country_code}&national_number={national_number}&type={payload_type}"
     )
     if code:
         url += f"&code={code}"
 
-    logger.info("Triggering MacroDroid -> +%s %s [%s]", country_code, national_number, payload_type)
+    logger.info("Triggering MacroDroid%s -> +%s %s [%s]", " (_1)" if base_url != MACRODROID_WEBHOOK_URL else "",
+                country_code, national_number, payload_type)
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=10) as response:
@@ -3661,7 +3675,7 @@ async def start_handler(message: Message):
         "3) Send numbers as text, or send a .txt file, then pick which OTP group to search (or All Groups). Files are saved while you are logged in, so you can resume them. A file remembers the OTP group you picked; change it from the file's menu in /numberfiles\n"
         "4) If the device requests a code, the bot searches your OTP groups (short backfill + live handlers) "
         f"for the number-derived pattern and sends the OTP it finds to the device. After {NO_CODE_AFTER_SECONDS}s without a code the "
-        "device gets no_code and the search keeps going. blocked / unavailable / try_again end the number at any point (unavailable is handled like Bad Num but shown as 🟤 Unavailable).\n"
+        "device gets no_code and the search keeps going. blocked / unavailable / try_again end the number at any point (unavailable is handled like Bad Num but shown as 🟤 Unavailable). A device status ending in _1 (e.g. continue_1) works like the plain status, and the rest of that number's webhook calls go to MACRODROID_WEBHOOK_URL_1; the next number starts on the normal URL again.\n"
         f"5) All waiting on the device shares one {DEVICE_STATE_WAIT_SECONDS // 60}-minute budget counted from the check. "
         f"If the device does not answer the check at all, it gets type=retry after {RETRY_AFTER_SECONDS}s and once more "
         f"{RETRY_AFTER_SECONDS}s later; any response from the device stops the retrying for that number. "
@@ -4565,11 +4579,12 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
     was abandoned because of /pause (it is restarted later), "unavailable" when the device said unavailable (ended
     as Bad Num, no clear; the batch counts these in a row), and None for every other ending.
     """
-    global device_status
+    global device_status, use_second_url
     num_msg = await message.answer(f"{num} ⏳ Checking on device...")
 
     device_event.clear()
     device_status = None
+    use_second_url = False          # every new number starts on the normal webhook
     check_sent_at = time.time()
     device_deadline = check_sent_at + DEVICE_STATE_WAIT_SECONDS   # one shared budget for all waiting on the device
 
@@ -5685,9 +5700,20 @@ async def handle_health_check(request):
     return web.Response(text="Bot is running live!")
 
 
+def _split_second_url_marker(status: str) -> Tuple[str, bool]:
+    """'blocked_1' -> ('blocked', True). Only a trailing _1 counts; the rest of the bot sees the plain status."""
+    status = status.strip()
+    if status.lower().endswith("_1"):
+        return (status[:-2] or "unknown"), True
+    return status, False
+
+
 async def handle_device_callback(request):
-    global device_status, device_event
-    status = request.query.get("status", "unknown")
+    global device_status, device_event, use_second_url
+    raw_status = request.query.get("status", "unknown")
+    status, second = _split_second_url_marker(raw_status)
+    if second:
+        use_second_url = True       # this number's remaining webhook calls go to MACRODROID_WEBHOOK_URL_1
 
     # the code the device saved in its `wscode` variable:  /device_callback?wscode=123456
     # (or  /device_callback?status=wscode&code=123456 )
@@ -5700,7 +5726,7 @@ async def handle_device_callback(request):
         # a wscode never touches device_status / device_event, so it can't be mistaken for a status answer
         return web.Response(text="wscode received" if accepted else "wscode ignored (no number is waiting for a code)")
 
-    logger.info("Received device callback -> %s", status)
+    logger.info("Received device callback -> %s", raw_status)
     device_status = status
     device_event.set()
     return web.Response(text="Callback received successfully")
