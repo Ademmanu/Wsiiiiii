@@ -3661,7 +3661,7 @@ async def start_handler(message: Message):
         "3) Send numbers as text, or send a .txt file, then pick which OTP group to search (or All Groups). Files are saved while you are logged in, so you can resume them. A file remembers the OTP group you picked; change it from the file's menu in /numberfiles\n"
         "4) If the device requests a code, the bot searches your OTP groups (short backfill + live handlers) "
         f"for the number-derived pattern and sends the OTP it finds to the device. After {NO_CODE_AFTER_SECONDS}s without a code the "
-        "device gets no_code and the search keeps going. blocked / unavailable / try_again end the number at any point (unavailable counts as Bad Num).\n"
+        "device gets no_code and the search keeps going. blocked / unavailable / try_again end the number at any point (unavailable is handled like Bad Num but shown as 🟤 Unavailable).\n"
         f"5) All waiting on the device shares one {DEVICE_STATE_WAIT_SECONDS // 60}-minute budget counted from the check. "
         f"If the device does not answer the check at all, it gets type=retry after {RETRY_AFTER_SECONDS}s and once more "
         f"{RETRY_AFTER_SECONDS}s later; any response from the device stops the retrying for that number. "
@@ -4408,9 +4408,9 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
         return ret or ("skipped" if status == "skipped" else "ended")
 
     async def unavailable() -> str:
-        # the device said unavailable: shown and logged exactly like Bad Num, but reported as "unavailable" so the
-        # batch can count how many came in a row
-        return await finish("⚫ Bad Num", "blocked", details="unavailable", ret="unavailable")
+        # the device said unavailable: handled like Bad Num, but shown and logged with its own status and
+        # reported as "unavailable" so the batch can count how many came in a row
+        return await finish("🟤 Unavailable", "unavailable", ret="unavailable")
 
     async def paused() -> str:
         await _device_pause_notice(num_msg, num)
@@ -4607,9 +4607,9 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
         return
 
     if "unavailable" in result_text:
-        # taken as Bad Num (same message, same log status); the batch counts how many came in a row
-        await num_msg.edit_text(f"{num} ⚫ Bad Num")
-        await log_number_status(num, "blocked", "unavailable")
+        # handled like Bad Num but shown and logged as Unavailable; the batch counts how many came in a row
+        await num_msg.edit_text(f"{num} 🟤 Unavailable")
+        await log_number_status(num, "unavailable")
         return "unavailable"
 
     if "try_again" in result_text:
