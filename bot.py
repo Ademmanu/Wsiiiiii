@@ -41,8 +41,9 @@ MACRODROID_WEBHOOK_URL = os.getenv(
     "MACRODROID_WEBHOOK_URL",
     "http://trigger.macrodroid.com/YOUR_UNIQUE_DEVICE_UUID/telegram_bot",
 )
-# second device's webhook: when the device sends the "switch" status, the current number restarts from type=check on
-# the other device (this URL), and every later webhook call for that number goes there. Empty = switching is off.
+# second device's webhook: when the device sends the "action" status and the marked /setaction option is Switch, the
+# current number restarts from type=check on the other device (this URL), and every later webhook call for that
+# number goes there. Numbers of Saved.txt always run on this device. Empty = switching is off.
 MACRODROID_WEBHOOK_URL_1 = os.getenv("MACRODROID_WEBHOOK_URL_1", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/dbname")
 PORT = int(os.getenv("PORT", "10000"))
@@ -57,6 +58,8 @@ OTP_SEARCH_DURATION = int(os.getenv("OTP_SEARCH_DURATION", "300"))
 
 # number files (/numberfiles)
 NUMBER_FILE_TTL_HOURS = int(os.getenv("NUMBER_FILE_TTL_HOURS", "48"))
+SAVED_FILE_NAME = "Saved.txt"          # the number file the Save action keeps numbers in (always run on the second device)
+DEVICE_ACTIONS = {"switch": "Switch", "save": "Save"}   # the buttons of /setaction (more will be added)
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(5 * 1024 * 1024)))
 FILES_PER_PAGE = 10
 OTP_PICK_PER_PAGE = 10
@@ -108,6 +111,9 @@ active_number: Optional[str] = None
 device_event = asyncio.Event()
 device_status: Optional[str] = None
 use_second_url = False  # True while the number is on the second device; every new number starts on the normal one
+second_device_only = False  # True while a number of Saved.txt is processed: it never leaves the second device
+user_device_actions: Dict[int, Optional[str]] = {}  # what the device's "action" status does, per user (/setaction); None = nothing
+active_batch_user_id: Optional[int] = None          # whose batch is running (the device callback has no user of its own)
 
 skip_current_number = False
 stop_requested = False  # set by /stop; every wait in the number flow checks it
@@ -190,6 +196,11 @@ _SCHEMA_STATEMENTS = [
             scope_chosen BOOLEAN NOT NULL DEFAULT FALSE,
             scope_set_name TEXT
         )"""),
+    ("user_device_action", """
+        CREATE TABLE IF NOT EXISTS user_device_action (
+            user_id BIGINT PRIMARY KEY,
+            action TEXT NOT NULL
+        )"""),
     ("ix_number_files_user", "CREATE INDEX IF NOT EXISTS ix_number_files_user ON number_files (user_id, created_at)"),
     # files created before the OTP group was remembered per file
     ("number_files.scope_chosen", "ALTER TABLE number_files ADD COLUMN IF NOT EXISTS scope_chosen BOOLEAN NOT NULL DEFAULT FALSE"),
@@ -216,6 +227,39 @@ async def init_db():
                 await conn.execute(statement)
             except Exception:
                 logger.exception(f"Schema step '{name}' failed; features that need it will not persist")
+
+
+async def _load_device_actions_on_startup():
+    """The option marked in /setaction is read back into memory at boot."""
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT user_id, action FROM user_device_action")
+    except Exception:
+        logger.exception("Could not load the saved device actions")
+        return
+    for row in rows:
+        if row["action"] in DEVICE_ACTIONS:
+            user_device_actions[int(row["user_id"])] = row["action"]
+
+
+async def db_set_device_action(user_id: int, action: Optional[str]) -> None:
+    """Remembers the option marked in /setaction (None = nothing marked)."""
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            if action is None:
+                await conn.execute("DELETE FROM user_device_action WHERE user_id = $1", user_id)
+            else:
+                await conn.execute(
+                    "INSERT INTO user_device_action (user_id, action) VALUES ($1, $2) "
+                    "ON CONFLICT (user_id) DO UPDATE SET action = EXCLUDED.action",
+                    user_id, action,
+                )
+    except Exception as e:
+        logger.warning(f"Could not save the device action for user {user_id}: {e}")
 
 
 async def _load_target_chats_on_startup():
@@ -3664,6 +3708,7 @@ async def start_handler(message: Message):
         "/setchatid - set the target chat that receives numbers and reports the result (it asks for the ID; send None to leave it empty)\n"
         "/otpgroups - manage OTP search sets (Name = pattern = group IDs)\n"
         "/numberfiles - saved .txt number files (kept 48h, resume where you stopped)\n"
+        "/setaction - choose what the device's action status does: Switch or Save (or nothing)\n"
         "/getallid - list the chat IDs of your logged-in account\n"
         "/pause | /resume | /next | /jumpto | /stats | /stop\n"
         "/pause holds the batch and /resume restarts the number you paused on. /jumpto asks which number of the file being "
@@ -3674,7 +3719,7 @@ async def start_handler(message: Message):
         "3) Send numbers as text, or send a .txt file, then pick which OTP group to search (or All Groups). Files are saved while you are logged in, so you can resume them. A file remembers the OTP group you picked; change it from the file's menu in /numberfiles\n"
         "4) If the device requests a code, the bot searches your OTP groups (short backfill + live handlers) "
         f"for the number-derived pattern and sends the OTP it finds to the device. After {NO_CODE_AFTER_SECONDS}s without a code the "
-        "device gets no_code and the search keeps going. blocked / unavailable / try_again end the number at any point (unavailable is handled like Bad Num but shown as 🟤 Unavailable). If the device sends switch (before it has continued), that number restarts from type=check on the other device (MACRODROID_WEBHOOK_URL_1), with fresh timers, and all its calls go there; every new number starts on the normal device.\n"
+        "device gets no_code and the search keeps going. blocked / unavailable / try_again end the number at any point (unavailable is handled like Bad Num but shown as 🟤 Unavailable). If the device sends action (before it has continued), the option marked in /setaction decides: Switch restarts that number from type=check on the other device (MACRODROID_WEBHOOK_URL_1), with fresh timers, and all its calls go there (every new number starts on the normal device); Save keeps the number in Saved.txt (always processed on the second device, 48h refreshed on every save) and moves to the next number; with none marked, action does nothing.\n"
         f"5) All waiting on the device shares one {DEVICE_STATE_WAIT_SECONDS // 60}-minute budget counted from the check. "
         f"If the device does not answer the check at all, it gets type=retry after {RETRY_AFTER_SECONDS}s and once more "
         f"{RETRY_AFTER_SECONDS}s later; any response from the device stops the retrying for that number. "
@@ -3820,7 +3865,56 @@ async def setchatid_handler(message: Message):
 # Inline buttons (fordet button_handler branches for login / logout /
 # getallid / otpgroups, copied verbatim)
 # ------------------------------------------------------------
-@router.callback_query(~F.data.startswith("nf_"), ~F.data.startswith("otpsel_"), ~F.data.startswith("pr_"))
+def _setaction_text(user_id: int) -> str:
+    current = user_device_actions.get(user_id)
+    shown = f"<b>{DEVICE_ACTIONS[current]}</b>" if current in DEVICE_ACTIONS else "<b>none</b> (action does nothing)"
+    text = (
+        "🟣 <b>Device action</b>\n\n"
+        "What the bot does when the device sends the <code>action</code> status:\n"
+        "• <b>Switch</b>: restarts the number from type=check on the other device\n"
+        f"• <b>Save</b>: keeps the number in {SAVED_FILE_NAME} and moves to the next number "
+        f"(that file always runs on the second device)\n\n"
+        "Tap an option to mark it ✅. Only one can be marked at a time; tap the marked one again to unmark it. "
+        "With none marked, action does nothing.\n\n"
+        f"Current: {shown}"
+    )
+    if current == "switch" and not MACRODROID_WEBHOOK_URL_1:
+        text += "\n\n⚠️ MACRODROID_WEBHOOK_URL_1 is not set, so Switch has no second device to go to."
+    return text
+
+
+def _setaction_markup(user_id: int) -> InlineKeyboardMarkup:
+    current = user_device_actions.get(user_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(("✅ " if current == key else "") + label, callback_data=f"act_{key}")]
+        for key, label in DEVICE_ACTIONS.items()
+    ])
+
+
+@router.message(Command("setaction"))
+async def setaction_handler(message: Message):
+    user_id = message.from_user.id
+    await message.answer(_setaction_text(user_id), parse_mode="HTML", reply_markup=_setaction_markup(user_id))
+
+
+@router.callback_query(F.data.startswith("act_"))
+async def setaction_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    key = (callback.data or "")[len("act_"):]
+    if key not in DEVICE_ACTIONS:
+        await callback.answer()
+        return
+    new_value = None if user_device_actions.get(user_id) == key else key     # tapping the marked one unmarks it
+    user_device_actions[user_id] = new_value
+    await db_set_device_action(user_id, new_value)
+    try:
+        await callback.message.edit_text(_setaction_text(user_id), parse_mode="HTML", reply_markup=_setaction_markup(user_id))
+    except TelegramBadRequest:
+        pass
+    await callback.answer(f"{DEVICE_ACTIONS[new_value]} marked" if new_value else "None marked: action does nothing")
+
+
+@router.callback_query(~F.data.startswith("nf_"), ~F.data.startswith("otpsel_"), ~F.data.startswith("pr_"), ~F.data.startswith("act_"))
 async def button_handler(callback: CallbackQuery):
     update, context = ptb_from_callback(callback)
     query = update.callback_query
@@ -4063,6 +4157,48 @@ async def db_get_number_file(user_id: int, file_id: int, with_numbers: bool = Fa
         return None
 
 
+async def db_save_number(user_id: int, number: str) -> bool:
+    """
+    Keeps a number in the user's Saved.txt number file (created on the first save). The number is added once
+    (never twice), and every save puts the file's remaining time back to the full NUMBER_FILE_TTL_HOURS.
+    """
+    if not db_pool:
+        return False
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=NUMBER_FILE_TTL_HOURS)
+    as_json = json.dumps([number])
+    try:
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, numbers @> $3::jsonb AS has
+                    FROM number_files
+                    WHERE user_id = $1 AND name = $2 AND expires_at > NOW()
+                    ORDER BY id LIMIT 1
+                    FOR UPDATE
+                    """,
+                    user_id, SAVED_FILE_NAME, as_json,
+                )
+                if row is None:
+                    await conn.execute(
+                        "INSERT INTO number_files (user_id, name, numbers, total, next_index, expires_at) "
+                        "VALUES ($1, $2, $3::jsonb, 1, 0, $4)",
+                        user_id, SAVED_FILE_NAME, as_json, expires_at,
+                    )
+                elif row["has"]:
+                    await conn.execute("UPDATE number_files SET expires_at = $2 WHERE id = $1", row["id"], expires_at)
+                else:
+                    await conn.execute(
+                        "UPDATE number_files SET numbers = numbers || $2::jsonb, total = total + 1, expires_at = $3 "
+                        "WHERE id = $1",
+                        row["id"], as_json, expires_at,
+                    )
+        return True
+    except Exception as e:
+        logger.exception(f"Error saving {number} to {SAVED_FILE_NAME} for user {user_id}: {e}")
+        return False
+
+
 async def db_set_file_progress(file_id: int, next_index: int) -> None:
     if not db_pool:
         return
@@ -4262,19 +4398,33 @@ def _scope_label(otp_set_name: Optional[str]) -> str:
     return otp_set_name if otp_set_name else "All Groups"
 
 
-def _switch_requested(status: str) -> bool:
-    """The device asked to move this number to the other device (only possible with a second webhook set)."""
-    return "switch" in status and bool(MACRODROID_WEBHOOK_URL_1)
+def _effective_action() -> Optional[str]:
+    """
+    What the device's "action" status does right now: "switch", "save", or None (do nothing). It is whatever is
+    marked in /setaction for the user whose batch is running. Switch also does nothing without a second webhook,
+    and for numbers of Saved.txt (they never leave the second device).
+    """
+    action = user_device_actions.get(active_batch_user_id) if active_batch_user_id is not None else None
+    if action == "switch" and (not MACRODROID_WEBHOOK_URL_1 or second_device_only):
+        return None
+    return action
+
+
+def _action_from_status(status: str) -> Optional[str]:
+    """The action to take for a device status: only the exact status "action" triggers one."""
+    return _effective_action() if status.strip().lower() == "action" else None
 
 
 def _search_interrupt_from_status() -> Optional[str]:
     """While searching for a code, blocked / unavailable / try_again from the device end the number
-    (it can turn out bad or delayed after the code was requested), and switch restarts it on the other device."""
+    (it can turn out bad or delayed after the code was requested), and the "action" status runs the marked
+    /setaction option (switch restarts the number on the other device, save keeps it in Saved.txt)."""
     if pause_interrupt:
         return "pause"                  # the user pressed /pause: abandon this number, /resume restarts it
     status = (device_status or "").lower()
-    if _switch_requested(status):
-        return "switch"
+    action = _action_from_status(status)
+    if action:
+        return action
     if "blocked" in status:
         return "blocked"
     if "unavailable" in status:
@@ -4302,8 +4452,9 @@ def _device_state_from_status() -> Optional[str]:
     if pause_interrupt:
         return "pause"
     status = (device_status or "").lower()
-    if _switch_requested(status):
-        return "switch"
+    action = _action_from_status(status)
+    if action:
+        return action
     if "blocked" in status:
         return "blocked"
     if "unavailable" in status:
@@ -4322,7 +4473,7 @@ def _device_state_from_status() -> Optional[str]:
 
 async def _wait_device_state(deadline: float) -> str:
     """Waits (inside the 5-minute device state wait) until the device answers.
-    Returns switch | blocked | unavailable | try_again | success | failure | error | continue | skip | timeout. Other callbacks are ignored."""
+    Returns switch | save | blocked | unavailable | try_again | success | failure | error | continue | skip | timeout. Other callbacks are ignored."""
     while True:
         _raise_if_stopped()
         state = _device_state_from_status()
@@ -4343,7 +4494,7 @@ async def _search_for_otp(num_msg, user_id: int, num: str, otp_set_name: Optiona
     One OTP search. Keeps going until a code is found, the device says blocked / try_again,
     /next, /stop or the time is up. After NO_CODE_AFTER_SECONDS without a code the device is told
     "no_code" once, and the search keeps running. Any other device callback only re-arms the wait.
-    Returns {"outcome": found | switch | blocked | unavailable | try_again | skip | none | nopattern, ...}.
+    Returns {"outcome": found | switch | save | blocked | unavailable | try_again | skip | none | nopattern, ...}.
     """
     global device_status
     scope_label = _scope_label(otp_set_name)
@@ -4411,9 +4562,9 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
       error    -> search again for a new code, all inside the shared 5-minute device budget
       blocked / unavailable / try_again at any point -> the number ends here (blocked / unavailable = Bad Num, try_again = Try Later)
     Returns "continue", "result" (the device itself reported success / failure), "timeout" (the number ended on
-    a timeout), "pause" (/pause was used: the number restarts later), "switch" (the device asked to move the number
-    to the other device: it restarts from type=check there), "unavailable" (ended as Bad Num because the device said
-    unavailable) or "ended".
+    a timeout), "pause" (/pause was used: the number restarts later), "switch" (the device sent action and Switch is
+    marked: the number restarts from type=check on the other device), "saved" (action with Save marked: the number
+    went to Saved.txt), "unavailable" (ended as Bad Num because the device said unavailable) or "ended".
     """
     global device_status
     scope_label = _scope_label(otp_set_name)
@@ -4443,6 +4594,9 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
         await _device_switch_notice(num_msg, num)
         return "switch"
 
+    async def saved() -> str:
+        return await _device_save(num_msg, user_id, num)
+
     if device_deadline - time.time() <= 0:
         return await finish("🟠 Ended (Device timeout - 5 mins)", "device_timeout", timed_out=True)
 
@@ -4454,6 +4608,8 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
             return await finish("⏭️ Skipped", "skipped")
         if outcome == "switch":
             return await switched()
+        if outcome == "save":
+            return await saved()
         if outcome == "blocked":
             return await finish("⚫ Bad Num", "blocked")
         if outcome == "unavailable":
@@ -4495,6 +4651,8 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
             return await finish("⏭️ Skipped", "skipped")
         if state == "switch":
             return await switched()
+        if state == "save":
+            return await saved()
         if state == "blocked":
             return await finish("⚫ Bad Num", "blocked")
         if state == "unavailable":
@@ -4526,6 +4684,17 @@ async def _device_pause_notice(num_msg, num: str) -> None:
 async def _device_switch_notice(num_msg, num: str) -> None:
     await num_msg.edit_text(f"{num} 🟣 Switched")
     await log_number_status(num, "switch")
+
+
+async def _device_save(num_msg, user_id: int, num: str) -> str:
+    """The device sent action with Save marked: the number is kept in Saved.txt and the batch moves on."""
+    if await db_save_number(user_id, num):
+        await num_msg.edit_text(f"{num} 🟣 Saved")
+        await log_number_status(num, "saved")
+        return "saved"
+    await num_msg.edit_text(f"{num} ⚠️ Could not save to {SAVED_FILE_NAME} (database unavailable)")
+    await log_number_status(num, "save_failed")
+    return "ended"
 
 
 async def _device_pause(message: Message, status_msg, idx: int, total: int) -> None:
@@ -4599,9 +4768,10 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
     number is currently on.
     Returns "timeout", "result" or "skipped" when the device has to be told to clear before the next number
     (the number ended on a timeout, a result was decided, or it was skipped / jumped over), "pause" when the number
-    was abandoned because of /pause (it is restarted later), "switch" when the device asked to move the number to
-    the other device (process_number restarts it there), "unavailable" when the device said unavailable (ended
-    as Bad Num, no clear; the batch counts these in a row), and None for every other ending.
+    was abandoned because of /pause (it is restarted later), "switch" when the device sent action with Switch marked
+    (process_number restarts the number on the other device), "saved" when it sent action with Save marked (the
+    number went to Saved.txt, no clear), "unavailable" when the device said unavailable (ended as Bad Num, no
+    clear; the batch counts these in a row), and None for every other ending.
     """
     global device_status
     num_msg = await message.answer(f"{num} ⏳ Checking on device...")
@@ -4639,9 +4809,12 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
         await _device_pause_notice(num_msg, num)
         return "pause"
 
-    if _switch_requested(result_text):
+    action = _action_from_status(result_text)
+    if action == "switch":
         await _device_switch_notice(num_msg, num)
         return "switch"
+    if action == "save":
+        return await _device_save(num_msg, user_id, num)
 
     if "blocked" in result_text:
         await num_msg.edit_text(f"{num} ⚫ Bad Num")
@@ -4667,7 +4840,7 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
     if "request_code" in result_text or "requestcode" in result_text or "request-code" in result_text:
         stage = await _otp_stage(num_msg, user_id, num, otp_set_name, device_deadline)
         if stage != "continue":
-            return stage if stage in ("timeout", "result", "pause", "skipped", "unavailable", "switch") else None
+            return stage if stage in ("timeout", "result", "pause", "skipped", "unavailable", "switch", "saved") else None
     else:
         result_after = (device_status or "").lower()
         if "continue" not in result_after and "continued" not in result_after and "proceed" not in result_after:
@@ -4803,15 +4976,17 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
 
 
 async def process_number(message: Message, user_id: int, target_chat: Optional[int], num: str,
-                         otp_set_name: Optional[str] = None) -> Optional[str]:
+                         otp_set_name: Optional[str] = None, start_on_second: bool = False) -> Optional[str]:
     """
-    A number always starts on the normal device. When the device sends the "switch" status (during the device
+    A number starts on the normal device, except numbers of Saved.txt (start_on_second), which always run on the
+    second one. When the device sends the "action" status and Switch is marked in /setaction (during the device
     check, the code search, or while waiting for its answer to the code) the number restarts from the very
     beginning on the other device: a fresh type=check, fresh timers, as if it had just started. Every call for the
     number goes to the device it is on, so the final clear also reaches that device. Another switch moves it back.
     """
-    global use_second_url
-    use_second_url = False
+    global use_second_url, second_device_only
+    second_device_only = start_on_second
+    use_second_url = start_on_second
     while True:
         outcome = await _process_number_once(message, user_id, target_chat, num, otp_set_name)
         if outcome != "switch":
@@ -4831,9 +5006,12 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
     crash or restart resumes at the number that was in flight (it is redone, never skipped).
     """
     global is_processing, is_paused, current_task, skip_current_number, current_index, \
-        total_numbers_count, active_number, active_file_id, stop_requested, jump_requested_index, pause_interrupt
+        total_numbers_count, active_number, active_file_id, stop_requested, jump_requested_index, pause_interrupt, \
+        active_batch_user_id
 
     total = len(numbers)
+    active_batch_user_id = user_id
+    saved_file_run = file_id is not None and file_name == SAVED_FILE_NAME   # Saved.txt always runs on the second device
     completed = start_index
     in_flight = False                  # a number has been started and is not finished yet
     stop_requested = False
@@ -4847,6 +5025,14 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             if file_id is not None:
                 text += "\n\n📂 Your file is saved — resume it from /numberfiles once this is fixed."
             await message.answer(text, parse_mode=parse_mode)
+            return
+
+        if saved_file_run and not MACRODROID_WEBHOOK_URL_1:
+            # Saved.txt only ever runs on the second device: without one the file is left exactly as it is
+            await message.answer(
+                f"❌ {SAVED_FILE_NAME} always runs on the second device, but MACRODROID_WEBHOOK_URL_1 is not set. "
+                f"Set it, then resume {SAVED_FILE_NAME} from /numberfiles. The file is untouched."
+            )
             return
 
         target_chat = await _get_user_target_chat(user_id)      # None = empty: nothing is forwarded
@@ -4912,7 +5098,8 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
                 continue
             await status_msg.edit_text(f"Processing batch\n\nProgress: {idx + 1}/{total}\nTarget: {num}")
 
-            outcome = await process_number(message, user_id, target_chat, num, otp_set_name)
+            outcome = await process_number(message, user_id, target_chat, num, otp_set_name,
+                                           start_on_second=saved_file_run)
 
             if jump_requested_index is not None:
                 # /jumpto: this number is abandoned and the file carries on from the number that was asked for
@@ -5001,6 +5188,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
         current_task = None
         active_number = None
         active_file_id = None
+        active_batch_user_id = None
         skip_current_number = False
         stop_requested = False
         jump_requested_index = None
@@ -5763,8 +5951,10 @@ async def handle_device_callback(request):
         return web.Response(text="wscode received" if accepted else "wscode ignored (no number is waiting for a code)")
 
     logger.info("Received device callback -> %s", status)
-    if "switch" in status.lower() and not MACRODROID_WEBHOOK_URL_1:
-        logger.warning("Device sent switch but MACRODROID_WEBHOOK_URL_1 is not set: ignoring it")
+    if status.strip().lower() == "action" and _effective_action() is None:
+        # nothing is marked in /setaction (or Switch cannot be done now): the action does nothing at all
+        logger.info("Device sent action but no action applies: ignoring it")
+        return web.Response(text="Callback received (no action marked, ignored)")
     device_status = status
     device_event.set()
     return web.Response(text="Callback received successfully")
@@ -5790,6 +5980,7 @@ async def main():
     global bot_instance
     await init_db()
     await _load_target_chats_on_startup()
+    await _load_device_actions_on_startup()
 
     bot = Bot(token=BOT_TOKEN)
     bot_instance = bot
