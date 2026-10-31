@@ -9,6 +9,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote
 
 import aiohttp
 import asyncpg
@@ -64,15 +65,15 @@ MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(5 * 1024 * 1024)))
 FILES_PER_PAGE = 10
 OTP_PICK_PER_PAGE = 10
 PENDING_BATCH_TTL = 600  # seconds a picked-but-unstarted batch stays valid (10 minutes)
-NO_CODE_AFTER_SECONDS = int(os.getenv("NO_CODE_AFTER_SECONDS", "50"))  # tell the device "no_code" after this long without a code
-DEVICE_STATE_WAIT_SECONDS = 300  # ONE shared budget for all waiting on the device, counted from the check
-RETRY_AFTER_SECONDS = int(os.getenv("RETRY_AFTER_SECONDS", "90"))  # silence after the check before type=retry is sent
+NO_CODE_AFTER_SECONDS = int(os.getenv("NO_CODE_AFTER_SECONDS", "60"))  # tell the device "no_code" after this long without a code
+DEVICE_STATE_WAIT_SECONDS = 360  # ONE shared budget for all waiting on the device, counted from the check
+RETRY_AFTER_SECONDS = int(os.getenv("RETRY_AFTER_SECONDS", "120"))  # silence after the check before type=retry is sent
 RETRY_MAX = int(os.getenv("RETRY_MAX", "2"))  # retries per number (the last one is the last)
 PAUSE_AUTO_RESUME_SECONDS = int(os.getenv("PAUSE_AUTO_RESUME_SECONDS", "300"))  # how long the pause lasts when the device sends unavailable too many times in a row
 UNAVAILABLE_PAUSE_AFTER = int(os.getenv("UNAVAILABLE_PAUSE_AFTER", "4"))  # consecutive "unavailable" answers from the device that trigger the pause
 # which entries count as real phone numbers: "strict" = international shape AND libphonenumber says valid, "shape" = shape only
 NUMBER_CHECK_MODE = os.getenv("NUMBER_CHECK", "strict").lower()
-RESULT_WAIT_SECONDS = int(os.getenv("RESULT_WAIT_SECONDS", "180"))  # separate wait for the chat result (3 minutes)
+RESULT_WAIT_SECONDS = int(os.getenv("RESULT_WAIT_SECONDS", "240"))  # separate wait for the chat result (4 minutes)
 # words the chat can answer with: any capitalisation, "contains"; the first one found in a message wins.
 # SUCCESS also covers successful / successfully; "unsuccessful", "unbanned" and "unblocked" are not matches.
 RESULT_KEYWORDS = ("SUCCESS", "FAILED", "BANNED", "BLOCKED", "ERROR")
@@ -94,8 +95,10 @@ bot_instance: Optional[Bot] = None
 # ------------------------------------------------------------
 db_pool: Optional[asyncpg.Pool] = None
 
-target_chat_id: Optional[int] = None
-user_target_chat_ids: dict[int, int] = {}
+# /setchatid: two target chats per user. At most one is on; the one that is on receives the numbers.
+#   Sell: the device's code is replied in the chat (type=wscode)      Pair: the chat's code goes to the device (type=link)
+CHAT_MODES = {"pair": "Pair", "sell": "Sell"}
+user_chat_cfg: Dict[int, Dict[str, Any]] = {}   # user -> {"pair_id": int|None, "sell_id": int|None, "active": "pair"|"sell"|None}
 
 is_processing = False
 is_paused = False
@@ -127,7 +130,8 @@ live_success_failure_events: dict[tuple, asyncio.Event] = {}
 live_success_failure_results: dict[tuple, str] = {}
 recent_chat_messages: Dict[int, OrderedDict] = {}  # last messages seen in the target chat, only to explain a timeout
 live_wscode_state: dict[tuple, dict] = {}  # per number waiting for a chat result: codes from the device + what to reply to
-live_success_failure_state: dict[tuple, dict] = {}  # per waiter: id of the message we sent + results seen before we knew it
+live_success_failure_state: dict[tuple, dict] = {}  # per waiter: id of the message we sent + results seen before we knew it + gate_open
+live_link_state: dict[tuple, dict] = {}  # Pair: per number, the first tap-to-copy code seen in the chat after the number was sent
 
 # fordet client / live-handler state
 user_clients: Dict[int, "ClientWrapper"] = {}
@@ -196,6 +200,13 @@ _SCHEMA_STATEMENTS = [
             scope_chosen BOOLEAN NOT NULL DEFAULT FALSE,
             scope_set_name TEXT
         )"""),
+    ("chat_modes", """
+        CREATE TABLE IF NOT EXISTS chat_modes (
+            user_id BIGINT PRIMARY KEY,
+            pair_id BIGINT,
+            sell_id BIGINT,
+            active TEXT
+        )"""),
     ("user_device_action", """
         CREATE TABLE IF NOT EXISTS user_device_action (
             user_id BIGINT PRIMARY KEY,
@@ -262,19 +273,57 @@ async def db_set_device_action(user_id: int, action: Optional[str]) -> None:
         logger.warning(f"Could not save the device action for user {user_id}: {e}")
 
 
-async def _load_target_chats_on_startup():
-    """Every user's saved target chat is read back into memory at boot."""
+async def _get_chat_cfg(user_id: int) -> Dict[str, Any]:
+    """
+    The user's Pair / Sell chat settings (loaded once, then kept in memory). A user who only had the old single
+    target chat gets it as the Sell ID with Sell on, so nothing changes for them until they open /setchatid.
+    """
+    cfg = user_chat_cfg.get(user_id)
+    if cfg is not None:
+        return cfg
+    cfg = {"pair_id": None, "sell_id": None, "active": None}
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT pair_id, sell_id, active FROM chat_modes WHERE user_id = $1", user_id)
+                if row is not None:
+                    cfg = {
+                        "pair_id": int(row["pair_id"]) if row["pair_id"] is not None else None,
+                        "sell_id": int(row["sell_id"]) if row["sell_id"] is not None else None,
+                        "active": row["active"] if row["active"] in CHAT_MODES else None,
+                    }
+                else:
+                    legacy = await conn.fetchrow("SELECT chat_id FROM bot_settings WHERE user_id = $1", user_id)
+                    if legacy is not None and legacy["chat_id"] is not None:
+                        cfg = {"pair_id": None, "sell_id": int(legacy["chat_id"]), "active": "sell"}
+        except Exception:
+            logger.exception(f"Could not load the chat settings of user {user_id}")
+    if cfg["active"] and not cfg[f"{cfg['active']}_id"]:
+        cfg["active"] = None                      # never on without an ID
+    user_chat_cfg[user_id] = cfg
+    return cfg
+
+
+async def _save_chat_cfg(user_id: int, cfg: Dict[str, Any]) -> bool:
+    """Stores the Pair / Sell settings in memory (already done by the caller) and in the database."""
+    user_chat_cfg[user_id] = cfg
     if not db_pool:
-        return
+        return False
     try:
         async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT user_id, chat_id FROM bot_settings")
+            await conn.execute(
+                """
+                INSERT INTO chat_modes (user_id, pair_id, sell_id, active)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (user_id)
+                DO UPDATE SET pair_id = EXCLUDED.pair_id, sell_id = EXCLUDED.sell_id, active = EXCLUDED.active
+                """,
+                user_id, cfg["pair_id"], cfg["sell_id"], cfg["active"],
+            )
+        return True
     except Exception:
-        logger.exception("Could not load saved target chat ids")
-        return
-    for row in rows:
-        user_target_chat_ids[int(row["user_id"])] = int(row["chat_id"]) if row["chat_id"] is not None else None
-    logger.info(f"Loaded {len(rows)} saved target chat id(s)")
+        logger.exception(f"Could not save the chat settings of user {user_id}")
+        return False
 
 
 async def log_number_status(phone_number: str, status: str, details: str = None):
@@ -313,7 +362,8 @@ def parse_phone_number(raw_number: str):
     return "", cleaned[1:]
 
 
-async def call_device_api(raw_number: str, payload_type: str = "check", code: str | None = None):
+async def call_device_api(raw_number: str, payload_type: str = "check", code: str | None = None,
+                          link_code: str | None = None):
     country_code, national_number = parse_phone_number(raw_number)
 
     # every call of a number goes to the device the number is on: the normal one until a "switch" status moves it
@@ -330,6 +380,8 @@ async def call_device_api(raw_number: str, payload_type: str = "check", code: st
     )
     if code:
         url += f"&code={code}"
+    if link_code:
+        url += f"&link_code={quote(link_code, safe='')}"       # type=link: the code the Pair chat showed
 
     logger.info("Triggering MacroDroid%s -> +%s %s [%s]", " (second device)" if base_url != MACRODROID_WEBHOOK_URL else "",
                 country_code, national_number, payload_type)
@@ -1836,6 +1888,8 @@ def check_result_message(user_id: int, text: str, msg_id: Optional[int] = None,
             if not _mentions_number(num, text):      # waiter without id tracking: the number alone decides
                 continue
         else:
+            if not state.get("gate_open", True):
+                continue                             # success / failed only count once the code step is done
             if state["sent_id"] is None:
                 # our send hasn't returned yet, so we can't tell where "after" starts: hold it
                 state["buffer"].append((msg_id, text, reply_to_id, edit_date))
@@ -1914,6 +1968,10 @@ def receive_wscode(code: str) -> bool:
     st["codes"].append(code)
     st["received"] += 1
     st["wake"].set()
+    fs = live_success_failure_state.get(key)
+    if fs is not None and not fs.get("gate_open"):
+        fs["gate_open"] = True          # Sell: success / failed are only expected after the device's code arrived
+        _forget_device_status()         # a success / failure the device sent before its code does not count
     logger.info(f"[wscode] code received from the device for {key[1]}")
     return True
 
@@ -1941,6 +1999,76 @@ def _wscode_summary(key: tuple) -> str:
     if not pending:
         return f"\nwscode: {st['replied']} code(s) sent as a reply."
     return f"\nwscode: {st['replied']} sent, {pending} not sent (the chat sent no message to reply to)."
+
+
+def _forget_device_status() -> None:
+    """Drops the last device status (and its wake-up) so only statuses sent from now on are looked at."""
+    global device_status
+    device_status = None
+    device_event.clear()
+
+
+def extract_copy_texts(message) -> List[str]:
+    """The tap-to-copy (monospace) texts of a Telegram message, in order, like 4ET3-5UIS."""
+    entities = getattr(message, "entities", None) or []
+    raw = getattr(message, "message", None) or getattr(message, "raw_text", None) or ""
+    if not entities or not raw:
+        return []
+    utf16 = raw.encode("utf-16-le")
+    texts: List[str] = []
+    for ent in entities:
+        if type(ent).__name__ not in ("MessageEntityCode", "MessageEntityPre"):
+            continue
+        offset, length = getattr(ent, "offset", None), getattr(ent, "length", None)
+        if offset is None or not length:
+            continue
+        piece = utf16[offset * 2:(offset + length) * 2].decode("utf-16-le", errors="ignore").strip()
+        if piece:
+            texts.append(piece)
+    return texts
+
+
+def check_link_code(user_id: int, message) -> None:
+    """
+    Pair: looks for the first tap-to-copy text in a chat message (new or edited) that arrived after the number was
+    sent. Only the first one is ever taken; a text that is just our number is not a code.
+    """
+    if not live_link_state or getattr(message, "out", False):
+        return
+    texts = extract_copy_texts(message)
+    if not texts:
+        return
+    msg_id = getattr(message, "id", None)
+    edit_date = getattr(message, "edit_date", None)
+    for key, st in list(live_link_state.items()):
+        if key[0] != user_id or st["code"] is not None:
+            continue
+        candidates = [t for t in texts if not _mentions_number(key[1], t)]
+        if not candidates:
+            continue
+        if st["sent_id"] is None:
+            st["buffer"].append((msg_id, edit_date, candidates[0]))      # our send hasn't returned yet: judge it later
+            continue
+        if not _is_after_send(st["sent_id"], st.get("sent_date"), msg_id, edit_date):
+            continue
+        st["code"] = candidates[0]
+        st["wake"].set()
+        logger.info(f"[link] code seen in the chat for {key[1]} (message {msg_id})")
+
+
+def arm_link_waiter(key: tuple, sent_id: Optional[int], sent_date=None) -> None:
+    """The number has been sent: only newer chat messages can hold the link code. Replays anything held back."""
+    st = live_link_state.get(key)
+    if st is None:
+        return
+    st["sent_id"] = sent_id if sent_id is not None else 0
+    st["sent_date"] = sent_date
+    for msg_id, edit_date, candidate in st["buffer"]:
+        if st["code"] is None and _is_after_send(st["sent_id"], sent_date, msg_id, edit_date):
+            st["code"] = candidate
+    st["buffer"].clear()
+    if st["code"] is not None:
+        st["wake"].set()
 
 
 async def _wait_any(events_: List[asyncio.Event], timeout: float) -> None:
@@ -1979,6 +2107,7 @@ async def update_result_handler_for_user(user_id: int):
                 logger.info(f"[chat] user {user_id} chat {chat_id} message {getattr(message, 'id', None)}: {text[:80]!r}")
             check_result_message(user_id, text, getattr(message, "id", None), getattr(message, "reply_to_msg_id", None),
                                  getattr(message, "edit_date", None))
+            check_link_code(user_id, message)              # Pair: the first tap-to-copy code after our number
             is_edit = getattr(message, "edit_date", None) is not None or "Edited" in type(event).__qualname__
             if not is_edit and not getattr(message, "out", False):
                 note_incoming_message(user_id, getattr(message, "id", None))
@@ -3553,22 +3682,18 @@ async def _load_saved_sessions_on_startup():
         await restore_single_session(row["user_id"], row["session_data"])
 
 
+async def _get_active_chat(user_id: int) -> Tuple[Optional[str], Optional[int]]:
+    """(mode, chat id) of the chat that is on: ("pair" | "sell", id), or (None, None) when both are off."""
+    cfg = await _get_chat_cfg(user_id)
+    mode = cfg["active"]
+    if mode and cfg[f"{mode}_id"]:
+        return mode, cfg[f"{mode}_id"]
+    return None, None
+
+
 async def _get_user_target_chat(user_id: int) -> Optional[int]:
-    # an entry (even an explicitly empty one) is final: the global fallback only applies to users with no entry at all
-    if user_id in user_target_chat_ids:
-        return user_target_chat_ids[user_id]
-
-    if not db_pool:
-        return target_chat_id
-
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT chat_id FROM bot_settings WHERE user_id = $1", user_id)
-    if row is not None:
-        chat_id = int(row["chat_id"]) if row["chat_id"] is not None else None
-        user_target_chat_ids[user_id] = chat_id
-        return chat_id
-
-    return target_chat_id
+    """The chat id that receives the numbers (None = both off / no ID: nothing is forwarded)."""
+    return (await _get_active_chat(user_id))[1]
 
 
 # ------------------------------------------------------------
@@ -3608,7 +3733,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
   /otpgroups - Configure OTP search groups
 
 🎯 **Target Chat:**
-  /setchatid - Set the target chat (asks for the ID)
+  /setchatid - Pair / Sell target chats (turn one on, set each ID)
 
 📂 **Number Files:**
   /numberfiles - Saved .txt batches (kept 48h)
@@ -3705,7 +3830,7 @@ async def start_handler(message: Message):
         "Commands:\n"
         "/login - connect your Telegram account (phone -> code -> 2FA)\n"
         "/logout - disconnect and remove your saved session\n"
-        "/setchatid - set the target chat that receives numbers and reports the result (it asks for the ID; send None to leave it empty)\n"
+        "/setchatid - Pair / Sell target chats: turn one on (never both) and set each one's ID (send None to empty it)\n"
         "/otpgroups - manage OTP search sets (Name = pattern = group IDs)\n"
         "/numberfiles - saved .txt number files (kept 48h, resume where you stopped)\n"
         "/setaction - choose what the device's action status does: Switch or Save (or nothing)\n"
@@ -3725,13 +3850,15 @@ async def start_handler(message: Message):
         f"{RETRY_AFTER_SECONDS}s later; any response from the device stops the retrying for that number. "
         "After the code is sent: continue starts the chat check, error searches for a new code, and success / failure "
         "straight from the device ends the number at once (🟢 Success / 🟠 Failure). While the chat is awaited the device "
-        "can still report success / failure too; whichever comes first wins.\n"
-        "6) On continue, your logged-in account sends the plain number (no forward tag) to the target chat, then tells the "
-        "device type=wscode. A code the device sends back to /device_callback?wscode=... is sent as a reply to the latest "
-        "message the chat sent you, while the bot waits up to "
-        f"{RESULT_WAIT_SECONDS // 60} minutes for a newer (or newly edited) message containing "
-        f"{', '.join(RESULT_KEYWORDS)} (any capitalisation; successful / successfully count as SUCCESS). "
-        "SUCCESS shows 🟢 Success, anything else 🟠 Failure. If no code comes back the bot just waits.\n"
+        "can still report success / failure too, but only once the code step is done; whichever comes first wins.\n"
+        "6) On continue, your logged-in account sends the plain number (no forward tag) to the chat that is on in /setchatid. "
+        "Sell: the device is told type=wscode, and a code it sends back to /device_callback?wscode=... is sent as a reply "
+        "to the latest message the chat sent you. Pair: nothing goes to the device yet; the first tap-to-copy text the chat "
+        "shows after the number (like 4ET3-5UIS) is sent to the device as type=link&link_code=... (only the first). "
+        f"The bot waits up to {RESULT_WAIT_SECONDS // 60} minutes for a newer (or newly edited) message containing "
+        f"{', '.join(RESULT_KEYWORDS)} (any capitalisation; successful / successfully count as SUCCESS), or for success / failure "
+        "from the device, but only after the code step is done (Sell: the device's code received, Pair: the link code sent). "
+        "SUCCESS shows 🟢 Success, anything else 🟠 Failure. If no code comes the bot just waits.\n"
         "7) When a number ends on a timeout, or a result is decided (from the chat or from the device), the device is told to clear before the "
         f"next number starts, and the bot waits {CLEAR_EXTRA_DELAY_SECONDS:g}s more than usual before that next number. Bad Num / Try Later / error are not cleared, and no_code is not an ending.\n"
         f"8) Only real phone numbers (with a country code, with or without +) are processed; anything else is ignored. "
@@ -3767,48 +3894,28 @@ async def otpgroups_cmd_handler(message: Message):
     await otpgroups_command(update, context)
 
 
-async def _set_target_chat(message: Message, user_id: int, chat_id: Optional[int]) -> None:
-    """Stores the target chat (None = empty: nothing is forwarded) in memory and in the database."""
-    global target_chat_id
-    user_target_chat_ids[user_id] = chat_id
-    if chat_id is not None:
-        target_chat_id = chat_id
-
-    saved = False
-    if db_pool:
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO bot_settings (user_id, chat_id)
-                    VALUES ($1, $2)
-                    ON CONFLICT (user_id)
-                    DO UPDATE SET chat_id = EXCLUDED.chat_id
-                    """,
-                    user_id,
-                    chat_id,
-                )
-            saved = True
-        except Exception:
-            logger.exception(f"Could not save target chat id for user {user_id}")
-
-    # the SUCCESS/FAILED/BANNED live handler follows the target chat
-    await update_result_handler_for_user(user_id)
-
+async def _set_chat_id(message: Message, user_id: int, mode: str, chat_id: Optional[int]) -> None:
+    """Sets (or empties) the ID of the Pair or Sell chat. An empty ID can't be on, so it turns that chat off."""
+    cfg = await _get_chat_cfg(user_id)
+    label = CHAT_MODES[mode]
+    if is_processing and cfg["active"] == mode:
+        await message.answer(f"⚠️ A batch is running on the {label} chat. Use /stop first, then change its ID.")
+        return
+    cfg[f"{mode}_id"] = chat_id
     if chat_id is None:
-        text = ("✅ Target chat ID is now empty. Numbers are not forwarded anywhere, but the bot still takes "
-                "continue / success / failure from the device.")
-        if not saved:
-            text += "\n⚠️ It could not be saved to the database, so it will be lost on restart."
-        await message.answer(text)
-    elif saved:
-        await message.answer(f"✅ Target chat ID successfully set to `{chat_id}`", parse_mode="Markdown")
+        if cfg["active"] == mode:
+            cfg["active"] = None
+            notice = f"✅ {label} chat ID is now empty, so {label} was turned off."
+        else:
+            notice = f"✅ {label} chat ID is now empty."
     else:
-        await message.answer(
-            f"⚠️ Target chat ID set to `{chat_id}` for now, but it could not be saved to the database, "
-            "so it will be lost on restart.",
-            parse_mode="Markdown",
-        )
+        notice = f"✅ {label} chat ID set to <code>{chat_id}</code>."
+    if not await _save_chat_cfg(user_id, cfg):
+        notice += "\n⚠️ It could not be saved to the database, so it will be lost on restart."
+    # the SUCCESS/FAILED live handler follows the chat that is on
+    await update_result_handler_for_user(user_id)
+    text, markup = _setchatid_mode_view(cfg, mode, notice)
+    await message.answer(text, parse_mode="HTML", reply_markup=markup)
 
 
 def _prompt_cancel_markup(first_row: Optional[list] = None) -> InlineKeyboardMarkup:
@@ -3821,12 +3928,12 @@ def _setchatid_markup() -> InlineKeyboardMarkup:
     return _prompt_cancel_markup([InlineKeyboardButton("🆔 Get chat IDs", callback_data="pr_ids")])
 
 
-async def _try_setchatid(message: Message, raw: str, retry: bool = False) -> str:
-    """Applies the answer to the /setchatid prompt ('None' = empty). Returns 'ok' or 'invalid'."""
+async def _try_setchatid(message: Message, raw: str, mode: str, retry: bool = False) -> str:
+    """Applies the answer to a Set ID / Change ID prompt ('None' = empty). Returns 'ok' or 'invalid'."""
     value = (raw or "").strip()
     user_id = message.from_user.id
     if value.lower() == "none":
-        await _set_target_chat(message, user_id, None)
+        await _set_chat_id(message, user_id, mode, None)
         return "ok"
     try:
         chat_id = int(value)
@@ -3837,28 +3944,134 @@ async def _try_setchatid(message: Message, raw: str, retry: bool = False) -> str
             reply_markup=_setchatid_markup() if retry else None,
         )
         return "invalid"
-    await _set_target_chat(message, user_id, chat_id)
+    await _set_chat_id(message, user_id, mode, chat_id)
     return "ok"
+
+
+def _mode_how(mode: str) -> str:
+    if mode == "pair":
+        return ("The number goes to this chat. The first tap-to-copy code the chat shows after it is sent to the "
+                "device (type=link with link_code). Success / failed count after that.")
+    return ("The number goes to this chat and the device is asked for its code (type=wscode); the device's code is "
+            "replied in the chat. Success / failed count after the device's code arrives.")
+
+
+def _chat_status_line(cfg: Dict[str, Any], mode: str) -> str:
+    chat_id = cfg[f"{mode}_id"]
+    shown = f"<code>{chat_id}</code>" if chat_id else "no ID set"
+    return f"• <b>{CHAT_MODES[mode]}</b>: {'✅ on' if cfg['active'] == mode else 'off'}, {shown}"
+
+
+def _setchatid_main_view(cfg: Dict[str, Any], notice: Optional[str] = None) -> Tuple[str, InlineKeyboardMarkup]:
+    text = (
+        "🎯 <b>Target chats</b>\n\n"
+        + "\n".join(_chat_status_line(cfg, m) for m in CHAT_MODES)
+        + "\n\nOnly one can be on; the one that is on receives the numbers. With both off (or no ID) nothing is "
+        "forwarded, but the bot still takes continue / success / failure from the device.\n"
+        "Tap Pair or Sell to turn it on or off and to set its ID."
+    )
+    if notice:
+        text = f"{notice}\n\n{text}"
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton(("✅ " if cfg["active"] == m else "") + label, callback_data=f"cm_open_{m}")
+        for m, label in CHAT_MODES.items()
+    ]])
+    return text, markup
+
+
+def _setchatid_mode_view(cfg: Dict[str, Any], mode: str, notice: Optional[str] = None) -> Tuple[str, InlineKeyboardMarkup]:
+    label = CHAT_MODES[mode]
+    chat_id = cfg[f"{mode}_id"]
+    on = cfg["active"] == mode
+    text = (
+        f"🎯 <b>{label} chat</b>\n\n"
+        f"Status: {'✅ on' if on else 'off'}\n"
+        f"ID: {f'<code>{chat_id}</code>' if chat_id else 'not set'}\n\n"
+        f"{_mode_how(mode)}"
+    )
+    if notice:
+        text = f"{notice}\n\n{text}"
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔴 Turn off" if on else "🟢 Turn on", callback_data=f"cm_tog_{mode}")],
+        [InlineKeyboardButton("✏️ Change ID" if chat_id else "➕ Set ID", callback_data=f"cm_id_{mode}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="cm_main")],
+    ])
+    return text, markup
 
 
 @router.message(Command("setchatid"))
 async def setchatid_handler(message: Message):
     user_id = message.from_user.id
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) >= 2:                                  # /setchatid <id> still works as a shortcut
-        await _try_setchatid(message, parts[1])
+    user_data_store.get(user_id, {}).pop('prompt', None)
+    cfg = await _get_chat_cfg(user_id)
+    text, markup = _setchatid_main_view(cfg)
+    await message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("cm_"))
+async def chatmode_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    data = callback.data or ""
+    cfg = await _get_chat_cfg(user_id)
+
+    async def show(view: Tuple[str, InlineKeyboardMarkup]) -> None:
+        try:
+            await callback.message.edit_text(view[0], parse_mode="HTML", reply_markup=view[1])
+        except TelegramBadRequest:
+            pass
+
+    if data == "cm_main":
+        await callback.answer()
+        await show(_setchatid_main_view(cfg))
         return
-    current = await _get_user_target_chat(user_id)
-    shown = f"<code>{current}</code>" if current else "not set (empty)"
-    user_data_store.setdefault(user_id, {})['prompt'] = {"kind": "setchatid", "ts": time.time()}
-    await message.answer(
-        "🎯 <b>Target chat ID</b>\n\n"
-        f"Current: {shown}\n\n"
-        "Send the chat ID (like <code>-1001234567890</code>), or send <code>None</code> to leave it empty.\n"
-        "Need the ID? Tap <b>Get chat IDs</b> (the same as /getallid), then send the ID here.",
-        parse_mode="HTML",
-        reply_markup=_setchatid_markup(),
-    )
+    action, _, mode = data[len("cm_"):].partition("_")
+    if mode not in CHAT_MODES:
+        await callback.answer()
+        return
+    label = CHAT_MODES[mode]
+
+    if action == "open":
+        await callback.answer()
+        await show(_setchatid_mode_view(cfg, mode))
+    elif action == "tog":
+        if is_processing:
+            await callback.answer("A batch is running. Use /stop first, then change the chats.", show_alert=True)
+            return
+        if cfg["active"] == mode:
+            cfg["active"] = None
+            notice = f"🔴 {label} is off."
+        else:
+            if not cfg[f"{mode}_id"]:
+                await callback.answer("Set an ID first.", show_alert=True)
+                return
+            other = next(m for m in CHAT_MODES if m != mode)
+            notice = f"🟢 {label} is on."
+            if cfg["active"] == other:
+                notice += f" {CHAT_MODES[other]} was turned off too (only one can be on)."
+            cfg["active"] = mode
+        if not await _save_chat_cfg(user_id, cfg):
+            notice += "\n⚠️ It could not be saved to the database, so it will be lost on restart."
+        await update_result_handler_for_user(user_id)
+        await callback.answer(notice.split("\n")[0])
+        await show(_setchatid_mode_view(cfg, mode, notice))
+    elif action == "id":
+        if is_processing and cfg["active"] == mode:
+            await callback.answer("A batch is running on this chat. Use /stop first.", show_alert=True)
+            return
+        chat_id = cfg[f"{mode}_id"]
+        shown = f"<code>{chat_id}</code>" if chat_id else "not set (empty)"
+        user_data_store.setdefault(user_id, {})['prompt'] = {"kind": "setchatid", "mode": mode, "ts": time.time()}
+        await callback.answer()
+        await callback.message.answer(
+            f"🎯 <b>{label} chat ID</b>\n\n"
+            f"Current: {shown}\n\n"
+            "Send the chat ID (like <code>-1001234567890</code>), or send <code>None</code> to leave it empty.\n"
+            "Need the ID? Tap <b>Get chat IDs</b> (the same as /getallid), then send the ID here.",
+            parse_mode="HTML",
+            reply_markup=_setchatid_markup(),
+        )
+    else:
+        await callback.answer()
 
 
 # ------------------------------------------------------------
@@ -3914,7 +4127,7 @@ async def setaction_callback(callback: CallbackQuery):
     await callback.answer(f"{DEVICE_ACTIONS[new_value]} marked" if new_value else "None marked: action does nothing")
 
 
-@router.callback_query(~F.data.startswith("nf_"), ~F.data.startswith("otpsel_"), ~F.data.startswith("pr_"), ~F.data.startswith("act_"))
+@router.callback_query(~F.data.startswith("nf_"), ~F.data.startswith("otpsel_"), ~F.data.startswith("pr_"), ~F.data.startswith("act_"), ~F.data.startswith("cm_"))
 async def button_handler(callback: CallbackQuery):
     update, context = ptb_from_callback(callback)
     query = update.callback_query
@@ -4762,10 +4975,12 @@ async def _wait_first_device_answer(num_msg, num: str, check_sent_at: float, dea
 
 
 async def _process_number_once(message: Message, user_id: int, target_chat: Optional[int], num: str,
-                               otp_set_name: Optional[str] = None) -> Optional[str]:
+                               otp_set_name: Optional[str] = None, chat_mode: Optional[str] = None) -> Optional[str]:
     """
     Runs one number through device check -> OTP search/send -> no-tag forward -> chat result, on the device the
-    number is currently on.
+    number is currently on. chat_mode is the chat that is on in /setchatid: "sell" (type=wscode, the device's code
+    is replied in the chat) or "pair" (the chat's tap-to-copy code is sent to the device as type=link); success /
+    failed only count after that code step. With no target chat nothing is forwarded and nothing is gated.
     Returns "timeout", "result" or "skipped" when the device has to be told to clear before the next number
     (the number ended on a timeout, a result was decided, or it was skipped / jumped over), "pause" when the number
     was abandoned because of /pause (it is restarted later), "switch" when the device sent action with Switch marked
@@ -4857,7 +5072,9 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
         await num_msg.edit_text(f"{num} ⏭️ Skipped")
         await log_number_status(num, "skipped")
         return "skipped"
-    if target_chat:
+    if target_chat and chat_mode == "pair":
+        await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and waiting for the link code from the chat...")
+    elif target_chat:
         await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting {'/'.join(RESULT_KEYWORDS)}...")
     else:
         await num_msg.edit_text(
@@ -4865,7 +5082,8 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
             "Waiting for success/failure from the device..."
         )
 
-    early = _device_outcome_from_status()
+    # with a target chat, success / failure only count after the code step (Sell: the device's code, Pair: the link code)
+    early = _device_outcome_from_status() if not target_chat else None
     if early:
         await num_msg.edit_text(f"{num} 🟢 Success" if early == "success" else f"{num} 🟠 Failure")
         await log_number_status(num, early, "from device")
@@ -4873,12 +5091,23 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
 
     key = (user_id, num)
     ev = asyncio.Event()
-    # register the waiter BEFORE sending; results are only accepted from messages newer than the one we send
+    pair = chat_mode == "pair" and bool(target_chat)
+    # register the waiter BEFORE sending; results are only accepted from messages newer than the one we send.
+    # gate_open: success / failed (from the chat or the device) only count once the code step is done:
+    # Sell = the device's code has been received, Pair = the chat's link code has been sent to the device.
+    # Without a target chat nothing is gated.
     live_success_failure_events[key] = ev
     live_success_failure_results.pop(key, None)
-    live_success_failure_state[key] = {"sent_id": None, "buffer": []}
-    live_wscode_state[key] = {"codes": [], "wake": asyncio.Event(), "reply_to": None, "held_incoming": [],
-                              "received": 0, "replied": 0}
+    gate = {"sent_id": None, "buffer": [], "gate_open": not target_chat}
+    live_success_failure_state[key] = gate
+    link_st = None
+    if pair:
+        link_st = {"sent_id": None, "sent_date": None, "buffer": [], "code": None, "wake": asyncio.Event()}
+        live_link_state[key] = link_st
+    else:
+        live_wscode_state[key] = {"codes": [], "wake": asyncio.Event(), "reply_to": None, "held_incoming": [],
+                                  "received": 0, "replied": 0}
+    link_sent = False
     try:
         sent_id = None
         if target_chat:
@@ -4892,16 +5121,24 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
 
             sent_id = sent_info.get("message_id")
             arm_result_waiter(key, sent_id, sent_info.get("sent_date"))
-            arm_wscode(key, sent_id)
+            if pair:
+                arm_link_waiter(key, sent_id, sent_info.get("sent_date"))
+            else:
+                arm_wscode(key, sent_id)
 
             result_deadline = time.time() + RESULT_WAIT_SECONDS
 
-            # the number is in the chat: ask the device for its code (wscode). If it sends one back it is replied to
-            # the chat's latest message while we keep waiting; if it never does, we simply follow the wait time.
-            await call_device_api(num, payload_type="wscode")
+            if not pair:
+                # Sell: the number is in the chat: ask the device for its code (wscode). If it sends one back it is
+                # replied to the chat's latest message while we keep waiting; if it never does, we simply follow the
+                # wait time. Pair sends nothing to the device until the chat shows its code.
+                await call_device_api(num, payload_type="wscode")
         else:
             # no target chat: nothing is forwarded, but success / failure from the device still ends the number
             result_deadline = time.time() + RESULT_WAIT_SECONDS
+
+        def wake_event() -> asyncio.Event:
+            return link_st["wake"] if link_st is not None else live_wscode_state[key]["wake"]
 
         # live handler only (new AND edited messages), like fordet: the chat is never polled
         got_result = False
@@ -4909,10 +5146,23 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
         device_outcome = None
         while True:
             _raise_if_stopped()
+            if link_st is not None and not link_sent and link_st["code"] is not None:
+                # Pair: the first code the chat showed goes to the device, once, as type=link with link_code
+                link_sent = True
+                link_code = link_st["code"]
+                if not await call_device_api(num, payload_type="link", link_code=link_code):
+                    await num_msg.edit_text(f"{num} 🔴 Error (Webhook failed)")
+                    await log_number_status(num, "webhook_error", "link")
+                    return None
+                gate["gate_open"] = True          # success / failed count from now on
+                _forget_device_status()           # what the device said before the link was sent does not count
+                await num_msg.edit_text(
+                    f"{num} 🟢 Link code {link_code} sent to the device. Awaiting {'/'.join(RESULT_KEYWORDS)}..."
+                )
             if ev.is_set():
                 got_result = True
                 break
-            device_outcome = _device_outcome_from_status()   # success / failure straight from the device
+            device_outcome = _device_outcome_from_status() if gate["gate_open"] else None   # success / failure straight from the device
             if device_outcome:
                 break
             if skip_current_number:          # /next (or /jumpto) while waiting for the result
@@ -4920,21 +5170,21 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
                 break
             if result_deadline - time.time() <= 0:
                 break
-            if target_chat:
+            if target_chat and not pair:
                 await _flush_wscodes(user_id, target_chat, key)
             if ev.is_set():
                 got_result = True
                 break
-            device_outcome = _device_outcome_from_status()
+            device_outcome = _device_outcome_from_status() if gate["gate_open"] else None
             if device_outcome:
                 break
             if skip_current_number:
                 skipped = True
                 break
-            await _wait_any([ev, live_wscode_state[key]["wake"], device_event], result_deadline - time.time())
-            live_wscode_state[key]["wake"].clear()
-            if device_event.is_set() and _device_outcome_from_status() is None:
-                device_event.clear()         # some other device callback: not an outcome, don't spin on it
+            await _wait_any([ev, wake_event(), device_event], result_deadline - time.time())
+            wake_event().clear()
+            if device_event.is_set() and (not gate["gate_open"] or _device_outcome_from_status() is None):
+                device_event.clear()         # not an outcome that counts (yet): don't spin on it
         _raise_if_stopped()
 
         if device_outcome and not got_result:
@@ -4956,10 +5206,14 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
             await log_number_status(num, decision.lower())
             return "result"
 
-        if target_chat:
+        if target_chat and pair and not link_sent:
+            await num_msg.edit_text(
+                f"{num} 🟠 Live decision timeout (No link code seen in the chat){_chat_seen_summary(user_id, sent_id)}"
+            )
+        elif target_chat:
             await num_msg.edit_text(
                 f"{num} 🟠 Live decision timeout (No {'/'.join(RESULT_KEYWORDS)} received)"
-                f"{_chat_seen_summary(user_id, sent_id)}{_wscode_summary(key)}"
+                f"{_chat_seen_summary(user_id, sent_id)}{'' if pair else _wscode_summary(key)}"
             )
         else:
             await num_msg.edit_text(
@@ -4973,10 +5227,12 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
         live_success_failure_results.pop(key, None)
         live_success_failure_state.pop(key, None)
         live_wscode_state.pop(key, None)
+        live_link_state.pop(key, None)
 
 
 async def process_number(message: Message, user_id: int, target_chat: Optional[int], num: str,
-                         otp_set_name: Optional[str] = None, start_on_second: bool = False) -> Optional[str]:
+                         otp_set_name: Optional[str] = None, start_on_second: bool = False,
+                         chat_mode: Optional[str] = None) -> Optional[str]:
     """
     A number starts on the normal device, except numbers of Saved.txt (start_on_second), which always run on the
     second one. When the device sends the "action" status and Switch is marked in /setaction (during the device
@@ -4988,7 +5244,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
     second_device_only = start_on_second
     use_second_url = start_on_second
     while True:
-        outcome = await _process_number_once(message, user_id, target_chat, num, otp_set_name)
+        outcome = await _process_number_once(message, user_id, target_chat, num, otp_set_name, chat_mode)
         if outcome != "switch":
             return outcome
         if skip_current_number:
@@ -5035,7 +5291,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             )
             return
 
-        target_chat = await _get_user_target_chat(user_id)      # None = empty: nothing is forwarded
+        chat_mode, target_chat = await _get_active_chat(user_id)   # the chat that is on (None = both off: nothing is forwarded)
 
         # make sure the live SUCCESS/FAILED handler is watching the current target chat
         if target_chat and result_live_handler_chat.get(user_id) != target_chat:
@@ -5099,7 +5355,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             await status_msg.edit_text(f"Processing batch\n\nProgress: {idx + 1}/{total}\nTarget: {num}")
 
             outcome = await process_number(message, user_id, target_chat, num, otp_set_name,
-                                           start_on_second=saved_file_run)
+                                           start_on_second=saved_file_run, chat_mode=chat_mode)
 
             if jump_requested_index is not None:
                 # /jumpto: this number is abandoned and the file carries on from the number that was asked for
@@ -5391,7 +5647,8 @@ async def prompt_text_handler(message: Message):
         result = await _try_jump(message, message.text, retry=True)
         done = result != "invalid"
     else:
-        result = await _try_setchatid(message, message.text, retry=True)
+        mode = user_data_store[user_id]['prompt'].get("mode") or "sell"
+        result = await _try_setchatid(message, message.text, mode, retry=True)
         done = result == "ok"
     if done:
         user_data_store.get(user_id, {}).pop('prompt', None)
@@ -5979,7 +6236,6 @@ async def start_web_server():
 async def main():
     global bot_instance
     await init_db()
-    await _load_target_chats_on_startup()
     await _load_device_actions_on_startup()
 
     bot = Bot(token=BOT_TOKEN)
