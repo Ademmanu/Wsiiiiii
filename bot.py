@@ -112,6 +112,7 @@ total_numbers_count = 0
 active_number: Optional[str] = None
 
 device_event = asyncio.Event()
+device_ack_event = asyncio.Event()   # the device called back, even if the bot ignored it (an action nothing is marked for)
 device_status: Optional[str] = None
 use_second_url = False  # True while the number is on the second device; every new number starts on the normal one
 second_device_only = False  # True while a number of Saved.txt is processed: it never leaves the second device
@@ -4685,7 +4686,7 @@ def _device_state_from_status() -> Optional[str]:
 
 
 async def _wait_device_state(deadline: float) -> str:
-    """Waits (inside the 5-minute device state wait) until the device answers.
+    """Waits (inside the shared device budget) until the device answers.
     Returns switch | save | blocked | unavailable | try_again | success | failure | error | continue | skip | timeout. Other callbacks are ignored."""
     while True:
         _raise_if_stopped()
@@ -4772,7 +4773,7 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
     """
     Device asked for a code: search, send it, then wait for the device's state before deciding anything.
       continue -> True (go on to the chat check)
-      error    -> search again for a new code, all inside the shared 5-minute device budget
+      error    -> search again for a new code, all inside the shared device budget
       blocked / unavailable / try_again at any point -> the number ends here (blocked / unavailable = Bad Num, try_again = Try Later)
     Returns "continue", "result" (the device itself reported success / failure), "timeout" (the number ended on
     a timeout), "pause" (/pause was used: the number restarts later), "switch" (the device sent action and Switch is
@@ -4811,7 +4812,7 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
         return await _device_save(num_msg, user_id, num)
 
     if device_deadline - time.time() <= 0:
-        return await finish("🟠 Ended (Device timeout - 5 mins)", "device_timeout", timed_out=True)
+        return await finish(f"🟠 Ended (Device timeout - {DEVICE_STATE_WAIT_SECONDS // 60} mins)", "device_timeout", timed_out=True)
 
     while True:
         res = await _search_for_otp(num_msg, user_id, num, otp_set_name, duration, sent_codes, device_deadline)
@@ -4875,18 +4876,28 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
         if state == "pause":
             return await paused()
         if state == "timeout":
-            return await finish("🟠 Ended (Device timeout after sending code - 5 mins)", "device_timeout_after_code", timed_out=True)
+            return await finish(f"🟠 Ended (Device timeout after sending code - {DEVICE_STATE_WAIT_SECONDS // 60} mins)", "device_timeout_after_code", timed_out=True)
 
         # state == "error": look for a new code, still inside the same device state wait
         remaining = device_deadline - time.time()
         if remaining <= 0:
-            return await finish("🟠 Ended (Device timeout after sending code - 5 mins)", "device_timeout_after_code", timed_out=True)
+            return await finish(f"🟠 Ended (Device timeout after sending code - {DEVICE_STATE_WAIT_SECONDS // 60} mins)", "device_timeout_after_code", timed_out=True)
         await num_msg.edit_text(f"{num} 🔁 Device reported an error. Rechecking OTP ({scope_label})...")
         duration = min(OTP_SEARCH_DURATION, remaining)
 
 
 def _human_secs(seconds: float) -> str:
     return f"{seconds / 60:g} minutes" if seconds >= 60 else f"{seconds:g} seconds"
+
+
+async def _edit_status(status_msg, text: str) -> None:
+    """Edits the batch's first ("Processing...") message; a failed edit (unchanged, deleted) never stops the batch."""
+    if status_msg is None:
+        return
+    try:
+        await status_msg.edit_text(text)
+    except Exception:
+        pass
 
 
 async def _device_pause_notice(num_msg, num: str) -> None:
@@ -4918,8 +4929,14 @@ async def _device_pause(message: Message, status_msg, idx: int, total: int) -> N
     global is_paused
     is_paused = True
     pause_event.clear()
+    await _edit_status(
+        status_msg,
+        f"⏸️ Processing paused\n\nProgress: {idx + 1}/{total}\n"
+        f"The device sent unavailable {UNAVAILABLE_PAUSE_AFTER} times in a row. "
+        f"Continuing with number {idx + 2} in {_human_secs(PAUSE_AUTO_RESUME_SECONDS)} (or /resume).",
+    )
     try:
-        # a new message (not an edit of the old status message, which is far up the chat by now) so the pause is seen
+        # plus a new message at the bottom of the chat so the pause is seen
         await message.answer(
             f"⏸️ Paused: the device sent unavailable {UNAVAILABLE_PAUSE_AFTER} times in a row (up to number "
             f"{idx + 1}/{total}). Continuing with number {idx + 2} in {_human_secs(PAUSE_AUTO_RESUME_SECONDS)} (or use /resume)."
@@ -4961,17 +4978,22 @@ async def _wait_first_device_answer(num_msg, num: str, check_sent_at: float, dea
         remaining = deadline - time.time()
         if remaining <= 0:
             return False
-        retry_at = window_start + RETRY_AFTER_SECONDS if retries < RETRY_MAX else None
+        # any callback from the device ends the retrying, even an "action" the bot ignores (nothing marked in /setaction)
+        acked = device_ack_event.is_set()
+        retry_at = window_start + RETRY_AFTER_SECONDS if (retries < RETRY_MAX and not acked) else None
         timeout = remaining if retry_at is None else min(remaining, max(0.0, retry_at - time.time()))
-        if await _wait_event(device_event, timeout):
+        await _wait_any([device_event] if acked else [device_event, device_ack_event], timeout)
+        if device_event.is_set():
             return True
         _raise_if_stopped()
+        if device_ack_event.is_set():
+            continue        # the device did respond (just not with something the bot acts on): no more retries
         if retry_at is not None and time.time() >= retry_at - 0.001 and deadline - time.time() > 0:
             retries += 1
             await num_msg.edit_text(f"{num} ⏳ No response from the device. Retry {retries}/{RETRY_MAX} sent...")
             if not await call_device_api(num, payload_type="retry"):
                 logger.warning(f"Could not send retry {retries} for {num}")
-            window_start = time.time()      # the next 90s of silence are counted from this retry
+            window_start = time.time()      # the next RETRY_AFTER_SECONDS of silence are counted from this retry
 
 
 async def _process_number_once(message: Message, user_id: int, target_chat: Optional[int], num: str,
@@ -4992,8 +5014,9 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
     num_msg = await message.answer(f"{num} ⏳ Checking on device...")
 
     device_event.clear()
+    device_ack_event.clear()
     device_status = None
-    check_sent_at = time.time()      # the timers (retry, no_code, the 5-minute device budget) all start from here
+    check_sent_at = time.time()      # the timers (retry, no_code, the device budget) all start from here
     device_deadline = check_sent_at + DEVICE_STATE_WAIT_SECONDS   # one shared budget for all waiting on the device
 
     success = await call_device_api(num, payload_type="check")
@@ -5009,7 +5032,7 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
             await num_msg.edit_text(f"{num} ⏭️ Skipped")
             await log_number_status(num, "skipped")
             return "skipped"
-        await num_msg.edit_text(f"{num} 🟠 Ended (Device timeout - 5 mins)")
+        await num_msg.edit_text(f"{num} 🟠 Ended (Device timeout - {DEVICE_STATE_WAIT_SECONDS // 60} mins)")
         await log_number_status(num, "device_timeout")
         return "timeout"
 
@@ -5270,6 +5293,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
     saved_file_run = file_id is not None and file_name == SAVED_FILE_NAME   # Saved.txt always runs on the second device
     completed = start_index
     in_flight = False                  # a number has been started and is not finished yet
+    status_msg = None                  # the first "Processing..." message, edited as the batch goes
     stop_requested = False
     jump_requested_index = None
     pause_interrupt = False
@@ -5328,6 +5352,11 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             skip_current_number = False
             in_flight = True
 
+            if is_paused:
+                await _edit_status(
+                    status_msg,
+                    f"⏸️ Processing paused\n\nProgress: {idx + 1}/{total}\nTarget: {num}\n/resume restarts this number from its start.",
+                )
             await pause_event.wait()
             pause_interrupt = False                        # a /pause pressed from here on abandons THIS number
             _raise_if_stopped()
@@ -5378,11 +5407,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             if outcome == "pause":
                 # paused by /pause: nothing counts as done, the same number is redone from its start
                 pause_interrupt = False
-                try:
-                    await status_msg.edit_text(f"⏸️ Paused at number {idx + 1}/{total}. /resume restarts this number from its start.")
-                except Exception:
-                    pass
-                # /pause already cleared pause_event: the top of the loop waits there until /resume
+                # /pause already cleared pause_event: the top of the loop marks the first message paused and waits there until /resume
                 continue
 
             completed = idx + 1
@@ -5420,10 +5445,16 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
         done_text = f"Batch completed.\nProcessed: {total}/{total}"
         if file_name:
             done_text += f"\n📂 File: {file_name}"
-        await status_msg.edit_text(done_text)
+        await _edit_status(status_msg, done_text)
+        try:
+            await message.answer(f"✅ {done_text}")        # a new message too, so the end is not hidden in the old one
+        except Exception:
+            logger.warning("Could not send the batch completed message")
 
     except (asyncio.CancelledError, BatchStopped):
         logger.info("Batch stopped by user request.")
+        where = f"on number {completed + 1}/{total}" if in_flight else f"after number {completed}/{total}"
+        await _edit_status(status_msg, f"⏹️ Processing stopped {where}.")
         if file_id is not None:
             try:
                 if in_flight:
@@ -6211,6 +6242,7 @@ async def handle_device_callback(request):
     if status.strip().lower() == "action" and _effective_action() is None:
         # nothing is marked in /setaction (or Switch cannot be done now): the action does nothing at all
         logger.info("Device sent action but no action applies: ignoring it")
+        device_ack_event.set()      # still a response: the no-response retries stop (nothing else changes)
         return web.Response(text="Callback received (no action marked, ignored)")
     device_status = status
     device_event.set()
