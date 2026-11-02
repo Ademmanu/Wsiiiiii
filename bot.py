@@ -38,13 +38,20 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
+# the device's MacroDroid link WITHOUT identifier (https://trigger.macrodroid.com/<device id>): the bot adds the
+# identifier of the batch's path to it
 MACRODROID_WEBHOOK_URL = os.getenv(
     "MACRODROID_WEBHOOK_URL",
-    "http://trigger.macrodroid.com/YOUR_UNIQUE_DEVICE_UUID/telegram_bot",
+    "http://trigger.macrodroid.com/YOUR_UNIQUE_DEVICE_UUID",
 )
+# the two paths a batch can go through. Each one has its own MacroDroid identifier, added after the device link:
+# <link>/whatsapp_path or <link>/telegram_path, so the same device link serves both paths.
+PATH_IDENTIFIERS = {"whatsapp": "whatsapp_path", "telegram": "telegram_path"}
+PATH_LABELS = {"whatsapp": "WhatsApp", "telegram": "Telegram"}
 # second device's webhook: when the device sends the "action" status and the marked /setaction option is Switch, the
 # current number restarts from type=check on the other device (this URL), and every later webhook call for that
-# number goes there. Numbers of Saved.txt always run on this device. Empty = switching is off.
+# number goes there. Numbers of the Saved files always run on this device. Also the link without identifier.
+# Empty = switching is off.
 MACRODROID_WEBHOOK_URL_1 = os.getenv("MACRODROID_WEBHOOK_URL_1", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/dbname")
 PORT = int(os.getenv("PORT", "10000"))
@@ -59,7 +66,10 @@ OTP_SEARCH_DURATION = int(os.getenv("OTP_SEARCH_DURATION", "300"))
 
 # number files (/numberfiles)
 NUMBER_FILE_TTL_HOURS = int(os.getenv("NUMBER_FILE_TTL_HOURS", "48"))
-SAVED_FILE_NAME = "Saved.txt"          # the number file the Save action keeps numbers in (always run on the second device)
+SAVED_INTERJECT_COUNT = 2              # numbers of a Saved file run when it is resumed while another batch is processing
+# the number files the Save action keeps numbers in, one per path (always run on the second device, on their own path)
+SAVED_FILES = {"whatsapp": "SavedWS.txt", "telegram": "SavedTG.txt"}
+SAVED_FILE_PATHS = {name: path for path, name in SAVED_FILES.items()}
 DEVICE_ACTIONS = {"switch": "Switch", "save": "Save"}   # the buttons of /setaction (more will be added)
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(5 * 1024 * 1024)))
 FILES_PER_PAGE = 10
@@ -105,7 +115,7 @@ is_paused = False
 current_task: Optional[asyncio.Task] = None
 active_file_id: Optional[int] = None
 _background_tasks: Set[asyncio.Task] = set()
-pending_batches: Dict[int, Dict] = {}  # batch waiting for the user to pick an OTP group
+pending_batches: Dict[int, Dict] = {}  # batch waiting for the user to pick an OTP group, then a path
 
 current_index = 0
 total_numbers_count = 0
@@ -114,8 +124,14 @@ active_number: Optional[str] = None
 device_event = asyncio.Event()
 device_ack_event = asyncio.Event()   # the device called back, even if the bot ignored it (an action nothing is marked for)
 device_status: Optional[str] = None
+active_path = "whatsapp"  # the path of the running batch (WhatsApp or Telegram): decides the webhook identifier
+active_otp_set_name: Optional[str] = None  # the OTP group of the running batch
+saved_interjection: Optional[Dict[str, Any]] = None  # Saved file numbers waiting for the paused batch to run them
+saved_interjection_running = False
+interjection_wake = asyncio.Event()  # wakes a paused batch when a Saved file run was requested
+device_pause_active = False  # True while the batch holds the unavailable pause
 use_second_url = False  # True while the number is on the second device; every new number starts on the normal one
-second_device_only = False  # True while a number of Saved.txt is processed: it never leaves the second device
+second_device_only = False  # True while a number of a Saved file is processed: it never leaves the second device
 user_device_actions: Dict[int, Optional[str]] = {}  # what the device's "action" status does, per user (/setaction); None = nothing
 active_batch_user_id: Optional[int] = None          # whose batch is running (the device callback has no user of its own)
 
@@ -199,7 +215,8 @@ _SCHEMA_STATEMENTS = [
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
             scope_chosen BOOLEAN NOT NULL DEFAULT FALSE,
-            scope_set_name TEXT
+            scope_set_name TEXT,
+            path TEXT
         )"""),
     ("chat_modes", """
         CREATE TABLE IF NOT EXISTS chat_modes (
@@ -217,6 +234,11 @@ _SCHEMA_STATEMENTS = [
     # files created before the OTP group was remembered per file
     ("number_files.scope_chosen", "ALTER TABLE number_files ADD COLUMN IF NOT EXISTS scope_chosen BOOLEAN NOT NULL DEFAULT FALSE"),
     ("number_files.scope_set_name", "ALTER TABLE number_files ADD COLUMN IF NOT EXISTS scope_set_name TEXT"),
+    # files made before the path (WhatsApp / Telegram) was remembered per file: NULL = not chosen yet
+    ("number_files.path", "ALTER TABLE number_files ADD COLUMN IF NOT EXISTS path TEXT"),
+    # Saved.txt is renamed to SavedWS.txt (the WhatsApp path's saved numbers) on every startup. Temporary: remove when asked.
+    ("rename Saved.txt", "UPDATE number_files SET name = 'SavedWS.txt', path = 'whatsapp' WHERE name = 'Saved.txt' "
+                         "AND NOT EXISTS (SELECT 1 FROM number_files f WHERE f.user_id = number_files.user_id AND f.name = 'SavedWS.txt')"),
     # prevents duplicate set names per user (add_otp_set relies on this)
     ("ux_otp_groups_user_name", "CREATE UNIQUE INDEX IF NOT EXISTS ux_otp_groups_user_name ON otp_groups (user_id, name)"),
 ]
@@ -363,17 +385,31 @@ def parse_phone_number(raw_number: str):
     return "", cleaned[1:]
 
 
+def _is_saved_file(name: Optional[str]) -> bool:
+    """SavedWS.txt (WhatsApp path) and SavedTG.txt (Telegram path): the files the Save action fills."""
+    return name in SAVED_FILE_PATHS
+
+
+def _webhook_for_path(base_url: str, path: str) -> str:
+    """The webhook of a path on a device: the device link (no identifier) plus the path's identifier."""
+    identifier = PATH_IDENTIFIERS.get(path, PATH_IDENTIFIERS["whatsapp"])
+    return f"{base_url.strip().rstrip('/')}/{identifier}"
+
+
 async def call_device_api(raw_number: str, payload_type: str = "check", code: str | None = None,
                           link_code: str | None = None):
     country_code, national_number = parse_phone_number(raw_number)
 
     # every call of a number goes to the device the number is on: the normal one until a "switch" status moves it
     base_url = MACRODROID_WEBHOOK_URL
+    on_second = False
     if use_second_url:
         if MACRODROID_WEBHOOK_URL_1:
             base_url = MACRODROID_WEBHOOK_URL_1
+            on_second = True
         else:
             logger.warning("Number is on the second device but MACRODROID_WEBHOOK_URL_1 is not set; using the normal URL")
+    base_url = _webhook_for_path(base_url, active_path)      # whatsapp_path / telegram_path
 
     url = (
         f"{base_url}"
@@ -384,7 +420,7 @@ async def call_device_api(raw_number: str, payload_type: str = "check", code: st
     if link_code:
         url += f"&link_code={quote(link_code, safe='')}"       # type=link: the code the Pair chat showed
 
-    logger.info("Triggering MacroDroid%s -> +%s %s [%s]", " (second device)" if base_url != MACRODROID_WEBHOOK_URL else "",
+    logger.info("Triggering MacroDroid %s%s -> +%s %s [%s]", active_path, " (second device)" if on_second else "",
                 country_code, national_number, payload_type)
     try:
         async with aiohttp.ClientSession() as session:
@@ -3842,10 +3878,10 @@ async def start_handler(message: Message):
         "How it works:\n"
         "1) /login and complete the interactive login flow\n"
         "2) /otpgroups to add OTP sets, e.g. HK = 2|TGT|3 = -100123456789\n"
-        "3) Send numbers as text, or send a .txt file, then pick which OTP group to search (or All Groups). Files are saved while you are logged in, so you can resume them. A file remembers the OTP group you picked; change it from the file's menu in /numberfiles\n"
+        "3) Send numbers as text, or send a .txt file, then pick which OTP group to search (or All Groups), then choose the path: WhatsApp (MacroDroid identifier whatsapp_path) or Telegram (telegram_path). Files are saved while you are logged in, so you can resume them. A file remembers the OTP group and the path you picked (change them from the file's menu in /numberfiles)\n"
         "4) If the device requests a code, the bot searches your OTP groups (short backfill + live handlers) "
         f"for the number-derived pattern and sends the OTP it finds to the device. After {NO_CODE_AFTER_SECONDS}s without a code the "
-        "device gets no_code and the search keeps going. blocked / unavailable / try_again end the number at any point (unavailable is handled like Bad Num but shown as 🟤 Unavailable). If the device sends action (before it has continued), the option marked in /setaction decides: Switch restarts that number from type=check on the other device (MACRODROID_WEBHOOK_URL_1), with fresh timers, and all its calls go there (every new number starts on the normal device); Save keeps the number in Saved.txt (always processed on the second device, 48h refreshed on every save) and moves to the next number; with none marked, action does nothing.\n"
+        "device gets no_code and the search keeps going. blocked / unavailable / try_again end the number at any point (unavailable is handled like Bad Num but shown as 🟤 Unavailable). If the device sends action (before it has continued), the option marked in /setaction decides: Switch restarts that number from type=check on the other device (MACRODROID_WEBHOOK_URL_1), with fresh timers, and all its calls go there (every new number starts on the normal device); Save keeps the number in SavedWS.txt (WhatsApp path) or SavedTG.txt (Telegram path), always processed on the second device with the file's own path (48h refreshed on every save), and moves to the next number; with none marked, action does nothing.\n"
         f"5) All waiting on the device shares one {DEVICE_STATE_WAIT_SECONDS // 60}-minute budget counted from the check. "
         f"If the device does not answer the check at all, it gets type=retry after {RETRY_AFTER_SECONDS}s and once more "
         f"{RETRY_AFTER_SECONDS}s later; any response from the device stops the retrying for that number. "
@@ -4086,8 +4122,8 @@ def _setaction_text(user_id: int) -> str:
         "🟣 <b>Device action</b>\n\n"
         "What the bot does when the device sends the <code>action</code> status:\n"
         "• <b>Switch</b>: restarts the number from type=check on the other device\n"
-        f"• <b>Save</b>: keeps the number in {SAVED_FILE_NAME} and moves to the next number "
-        f"(that file always runs on the second device)\n\n"
+        f"• <b>Save</b>: keeps the number in {SAVED_FILES['whatsapp']} (WhatsApp path) or {SAVED_FILES['telegram']} "
+        "(Telegram path) and moves to the next number (those files always run on the second device)\n\n"
         "Tap an option to mark it ✅. Only one can be marked at a time; tap the marked one again to unmark it. "
         "With none marked, action does nothing.\n\n"
         f"Current: {shown}"
@@ -4128,7 +4164,7 @@ async def setaction_callback(callback: CallbackQuery):
     await callback.answer(f"{DEVICE_ACTIONS[new_value]} marked" if new_value else "None marked: action does nothing")
 
 
-@router.callback_query(~F.data.startswith("nf_"), ~F.data.startswith("otpsel_"), ~F.data.startswith("pr_"), ~F.data.startswith("act_"), ~F.data.startswith("cm_"))
+@router.callback_query(~F.data.startswith("nf_"), ~F.data.startswith("otpsel_"), ~F.data.startswith("pr_"), ~F.data.startswith("act_"), ~F.data.startswith("cm_"), ~F.data.startswith("pathsel_"))
 async def button_handler(callback: CallbackQuery):
     update, context = ptb_from_callback(callback)
     query = update.callback_query
@@ -4351,7 +4387,7 @@ async def db_list_number_files(user_id: int) -> List[Dict]:
 async def db_get_number_file(user_id: int, file_id: int, with_numbers: bool = False) -> Optional[Dict]:
     if not db_pool:
         return None
-    cols = "id, name, total, next_index, created_at, expires_at, scope_chosen, scope_set_name"
+    cols = "id, name, total, next_index, created_at, expires_at, scope_chosen, scope_set_name, path"
     if with_numbers:
         cols += ", numbers::text AS numbers"
     try:
@@ -4371,13 +4407,16 @@ async def db_get_number_file(user_id: int, file_id: int, with_numbers: bool = Fa
         return None
 
 
-async def db_save_number(user_id: int, number: str) -> bool:
+async def db_save_number(user_id: int, number: str, path: str = "whatsapp") -> bool:
     """
-    Keeps a number in the user's Saved.txt number file (created on the first save). The number is added once
-    (never twice), and every save puts the file's remaining time back to the full NUMBER_FILE_TTL_HOURS.
+    Keeps a number in the user's SavedWS.txt (WhatsApp path) or SavedTG.txt (Telegram path) number file, created on
+    the first save. The number is added once (never twice), and every save puts the file's remaining time back to
+    the full NUMBER_FILE_TTL_HOURS.
     """
     if not db_pool:
         return False
+    path = path if path in SAVED_FILES else "whatsapp"
+    file_name = SAVED_FILES[path]
     expires_at = datetime.now(timezone.utc) + timedelta(hours=NUMBER_FILE_TTL_HOURS)
     as_json = json.dumps([number])
     try:
@@ -4391,13 +4430,13 @@ async def db_save_number(user_id: int, number: str) -> bool:
                     ORDER BY id LIMIT 1
                     FOR UPDATE
                     """,
-                    user_id, SAVED_FILE_NAME, as_json,
+                    user_id, file_name, as_json,
                 )
                 if row is None:
                     await conn.execute(
-                        "INSERT INTO number_files (user_id, name, numbers, total, next_index, expires_at) "
-                        "VALUES ($1, $2, $3::jsonb, 1, 0, $4)",
-                        user_id, SAVED_FILE_NAME, as_json, expires_at,
+                        "INSERT INTO number_files (user_id, name, numbers, total, next_index, expires_at, path) "
+                        "VALUES ($1, $2, $3::jsonb, 1, 0, $4, $5)",
+                        user_id, file_name, as_json, expires_at, path,
                     )
                 elif row["has"]:
                     await conn.execute("UPDATE number_files SET expires_at = $2 WHERE id = $1", row["id"], expires_at)
@@ -4409,7 +4448,7 @@ async def db_save_number(user_id: int, number: str) -> bool:
                     )
         return True
     except Exception as e:
-        logger.exception(f"Error saving {number} to {SAVED_FILE_NAME} for user {user_id}: {e}")
+        logger.exception(f"Error saving {number} to {file_name} for user {user_id}: {e}")
         return False
 
 
@@ -4436,6 +4475,21 @@ async def db_set_file_scope(user_id: int, file_id: int, set_name: Optional[str],
         return int(status.split()[-1]) > 0
     except Exception as e:
         logger.exception(f"Error saving the OTP group of file {file_id}: {e}")
+        return False
+
+
+async def db_set_file_path(user_id: int, file_id: int, path: Optional[str]) -> bool:
+    """Remembers which path (WhatsApp / Telegram) a file uses; None forgets it."""
+    if not db_pool:
+        return False
+    try:
+        async with db_pool.acquire() as conn:
+            status = await conn.execute(
+                "UPDATE number_files SET path = $3 WHERE id = $1 AND user_id = $2", file_id, user_id, path,
+            )
+        return int(status.split()[-1]) > 0
+    except Exception as e:
+        logger.exception(f"Error saving the path of file {file_id}: {e}")
         return False
 
 
@@ -4553,11 +4607,11 @@ def _claim_batch() -> bool:
 
 
 def _spawn_batch(message: Message, user_id: int, numbers: List[str], file_id: Optional[int], start_index: int,
-                 file_name: Optional[str], otp_set_name: Optional[str]) -> None:
+                 file_name: Optional[str], otp_set_name: Optional[str], path: str = "whatsapp") -> None:
     """Starts the (already claimed) batch in the background so the button press returns at once."""
     task = asyncio.create_task(run_batch(
         message, user_id, numbers, file_id=file_id, start_index=start_index,
-        file_name=file_name, otp_set_name=otp_set_name,
+        file_name=file_name, otp_set_name=otp_set_name, path=path,
     ))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -4616,7 +4670,7 @@ def _effective_action() -> Optional[str]:
     """
     What the device's "action" status does right now: "switch", "save", or None (do nothing). It is whatever is
     marked in /setaction for the user whose batch is running. Switch also does nothing without a second webhook,
-    and for numbers of Saved.txt (they never leave the second device).
+    and for numbers of the Saved files (they never leave the second device).
     """
     action = user_device_actions.get(active_batch_user_id) if active_batch_user_id is not None else None
     if action == "switch" and (not MACRODROID_WEBHOOK_URL_1 or second_device_only):
@@ -4632,7 +4686,7 @@ def _action_from_status(status: str) -> Optional[str]:
 def _search_interrupt_from_status() -> Optional[str]:
     """While searching for a code, blocked / unavailable / try_again from the device end the number
     (it can turn out bad or delayed after the code was requested), and the "action" status runs the marked
-    /setaction option (switch restarts the number on the other device, save keeps it in Saved.txt)."""
+    /setaction option (switch restarts the number on the other device, save keeps it in the Saved file of the path)."""
     if pause_interrupt:
         return "pause"                  # the user pressed /pause: abandon this number, /resume restarts it
     status = (device_status or "").lower()
@@ -4778,7 +4832,7 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
     Returns "continue", "result" (the device itself reported success / failure), "timeout" (the number ended on
     a timeout), "pause" (/pause was used: the number restarts later), "switch" (the device sent action and Switch is
     marked: the number restarts from type=check on the other device), "saved" (action with Save marked: the number
-    went to Saved.txt), "unavailable" (ended as Bad Num because the device said unavailable) or "ended".
+    went to a Saved file), "unavailable" (ended as Bad Num because the device said unavailable) or "ended".
     """
     global device_status
     scope_label = _scope_label(otp_set_name)
@@ -4911,12 +4965,12 @@ async def _device_switch_notice(num_msg, num: str) -> None:
 
 
 async def _device_save(num_msg, user_id: int, num: str) -> str:
-    """The device sent action with Save marked: the number is kept in Saved.txt and the batch moves on."""
-    if await db_save_number(user_id, num):
+    """The device sent action with Save marked: the number is kept in the Saved file of the batch's path and the batch moves on."""
+    if await db_save_number(user_id, num, active_path):
         await num_msg.edit_text(f"{num} 🟣 Saved")
         await log_number_status(num, "saved")
         return "saved"
-    await num_msg.edit_text(f"{num} ⚠️ Could not save to {SAVED_FILE_NAME} (database unavailable)")
+    await num_msg.edit_text(f"{num} ⚠️ Could not save to {SAVED_FILES[active_path]} (database unavailable)")
     await log_number_status(num, "save_failed")
     return "ended"
 
@@ -4926,8 +4980,9 @@ async def _device_pause(message: Message, status_msg, idx: int, total: int) -> N
     The device sent unavailable UNAVAILABLE_PAUSE_AFTER times in a row: hold the batch for PAUSE_AUTO_RESUME_SECONDS
     (or until /resume), then carry on with the next number (the unavailable ones already ended as Bad Num).
     """
-    global is_paused
+    global is_paused, device_pause_active
     is_paused = True
+    device_pause_active = True
     pause_event.clear()
     await _edit_status(
         status_msg,
@@ -4943,15 +4998,144 @@ async def _device_pause(message: Message, status_msg, idx: int, total: int) -> N
         )
     except Exception as exc:
         logger.warning(f"Could not send the unavailable-pause notice: {exc}")
-    resumed_by_user = await _wait_event(pause_event, PAUSE_AUTO_RESUME_SECONDS)
-    _raise_if_stopped()
+    try:
+        interjection_wake.clear()
+        if saved_interjection is None:
+            # a Saved file run requested meanwhile ends the pause early (it runs first, then the batch goes on)
+            await _wait_any([pause_event, interjection_wake], PAUSE_AUTO_RESUME_SECONDS)
+        _raise_if_stopped()
+        resumed_by_user = pause_event.is_set()
+    finally:
+        device_pause_active = False
     if not resumed_by_user:
         is_paused = False
         pause_event.set()
         try:
-            await message.answer(f"▶️ Pause over. Continuing with number {idx + 2}/{total}...")
+            if saved_interjection is not None:
+                await message.answer(f"▶️ Pause ended early: running {saved_interjection['file_name']} first, then number {idx + 2}/{total}...")
+            else:
+                await message.answer(f"▶️ Pause over. Continuing with number {idx + 2}/{total}...")
         except Exception as exc:
             logger.warning(f"Could not send the pause-over notice: {exc}")
+
+
+async def _request_saved_interjection(callback: CallbackQuery, query, user_id: int, rec: Dict) -> bool:
+    """
+    A Saved file (SavedWS.txt / SavedTG.txt) was resumed while another batch is processing and Save is the marked
+    /setaction option: the running batch is paused, the next SAVED_INTERJECT_COUNT numbers of the file run on the
+    second device (on the file's own path), then the batch carries on from where it was. Returns True when this took the tap (started it, or refused it with its own message).
+    """
+    global saved_interjection, is_paused, pause_interrupt
+    if (not _is_saved_file(rec["name"]) or user_device_actions.get(user_id) != "save"
+            or active_batch_user_id != user_id or active_file_id == rec["id"]):
+        return False
+    file_name = rec["name"]
+    if not MACRODROID_WEBHOOK_URL_1:
+        await query.answer(f"{file_name} always runs on the second device, but MACRODROID_WEBHOOK_URL_1 is not set.",
+                           show_alert=True)
+        return True
+    if saved_interjection is not None or saved_interjection_running:
+        await query.answer("A Saved file is already queued to run.", show_alert=True)
+        return True
+    start = rec["next_index"] if 0 < rec["next_index"] < rec["total"] else 0
+    numbers = rec["numbers"][start:start + SAVED_INTERJECT_COUNT]
+    if not numbers:
+        await query.answer(f"{file_name} has no numbers to run.", show_alert=True)
+        return True
+
+    # its own OTP group if it remembers one, else the one of the batch it interrupts; the path is the file's own
+    otp_set_name = active_otp_set_name
+    if rec.get("scope_chosen"):
+        saved_name = rec.get("scope_set_name")
+        if saved_name is None or any(x["name"] == saved_name for x in await db_get_otp_sets(user_id)):
+            otp_set_name = saved_name
+    path = SAVED_FILE_PATHS[file_name]
+
+    was_paused_by_user = is_paused and not device_pause_active
+    saved_interjection = dict(message=callback.message, user_id=user_id, file_id=rec["id"], file_name=file_name,
+                              start=start, numbers=numbers, otp_set_name=otp_set_name, path=path,
+                              resume_after=not was_paused_by_user)
+    if not is_paused:
+        is_paused = True
+        pause_event.clear()
+        pause_interrupt = True          # the number in flight is abandoned; it restarts from its start afterwards
+        device_event.set()              # wake whatever it is waiting for
+        for st in list(live_wscode_state.values()):
+            st["wake"].set()
+    interjection_wake.set()
+    await query.answer()
+    try:
+        await query.edit_message_text(
+            f"⏸️ {'Pausing the running batch. ' if not was_paused_by_user else ''}{file_name} will run its next "
+            f"{len(numbers)} number(s) on the second device (Path: {PATH_LABELS[path]}), then "
+            f"{'the batch continues from where it was.' if not was_paused_by_user else 'the batch stays paused (/resume continues it).'}"
+        )
+    except Exception:
+        pass
+    return True
+
+
+async def _run_saved_interjection() -> None:
+    """
+    Runs the numbers of a requested Saved file interjection (always on the second device) while the main batch is
+    paused, then lets the batch carry on. Runs inside the batch loop, so /stop works as usual.
+    """
+    global saved_interjection, saved_interjection_running, active_path, active_number, skip_current_number
+    global is_paused, pause_interrupt
+    req = saved_interjection
+    if req is None:
+        return
+    saved_interjection = None
+    saved_interjection_running = True
+    pause_interrupt = False             # the number that was in flight is already abandoned
+    message, user_id = req["message"], req["user_id"]
+    previous_path, previous_number = active_path, active_number
+    active_path = req["path"]
+    try:
+        chat_mode, target_chat = await _get_active_chat(user_id)
+        numbers = req["numbers"]
+        await message.answer(
+            f"▶️ Running the next {len(numbers)} number(s) of {req['file_name']} on the second device "
+            f"• Path: {PATH_LABELS[req['path']]} • OTP group: {_scope_label(req['otp_set_name'])}"
+        )
+        for k, num in enumerate(numbers):
+            _raise_if_stopped()
+            active_number = num
+            skip_current_number = False
+            outcome = await process_number(message, user_id, target_chat, num, req["otp_set_name"],
+                                           start_on_second=True, chat_mode=chat_mode)
+            clear_sent = False
+            if outcome in ("timeout", "result", "skipped"):
+                if not await call_device_api(num, payload_type="clear"):
+                    logger.warning(f"Could not send clear for {num}")
+                clear_sent = True
+            _raise_if_stopped()
+            await db_set_file_progress(req["file_id"], req["start"] + k + 1)
+            if clear_sent and CLEAR_EXTRA_DELAY_SECONDS > 0:
+                await asyncio.sleep(CLEAR_EXTRA_DELAY_SECONDS)
+            if NEXT_NUMBER_DELAY_SECONDS > 0:
+                await asyncio.sleep(NEXT_NUMBER_DELAY_SECONDS)       # a number of the main batch follows
+        if req["resume_after"]:
+            await message.answer(f"✅ {req['file_name']}: {len(numbers)} number(s) done. Continuing the paused batch...")
+        else:
+            await message.answer(f"✅ {req['file_name']}: {len(numbers)} number(s) done. The batch stays paused: /resume continues it.")
+    finally:
+        active_path, active_number = previous_path, previous_number
+        skip_current_number = False
+        saved_interjection_running = False
+        if req["resume_after"]:
+            is_paused = False
+            pause_event.set()
+
+
+async def _wait_resume_serving_interjections() -> None:
+    """Waits while the batch is paused; a Saved file run requested meanwhile is served right away."""
+    while not pause_event.is_set():
+        interjection_wake.clear()
+        if saved_interjection is not None:
+            await _run_saved_interjection()
+            continue
+        await _wait_any([pause_event, interjection_wake], 3600)
 
 
 async def _take_jump(file_id: Optional[int]) -> int:
@@ -5007,7 +5191,7 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
     (the number ended on a timeout, a result was decided, or it was skipped / jumped over), "pause" when the number
     was abandoned because of /pause (it is restarted later), "switch" when the device sent action with Switch marked
     (process_number restarts the number on the other device), "saved" when it sent action with Save marked (the
-    number went to Saved.txt, no clear), "unavailable" when the device said unavailable (ended as Bad Num, no
+    number went to a Saved file, no clear), "unavailable" when the device said unavailable (ended as Bad Num, no
     clear; the batch counts these in a row), and None for every other ending.
     """
     global device_status
@@ -5257,7 +5441,7 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
                          otp_set_name: Optional[str] = None, start_on_second: bool = False,
                          chat_mode: Optional[str] = None) -> Optional[str]:
     """
-    A number starts on the normal device, except numbers of Saved.txt (start_on_second), which always run on the
+    A number starts on the normal device, except numbers of the Saved files (start_on_second), which always run on the
     second one. When the device sends the "action" status and Switch is marked in /setaction (during the device
     check, the code search, or while waiting for its answer to the code) the number restarts from the very
     beginning on the other device: a fresh type=check, fresh timers, as if it had just started. Every call for the
@@ -5278,7 +5462,8 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
 
 async def run_batch(message: Message, user_id: int, numbers: List[str],
                     file_id: Optional[int] = None, start_index: int = 0,
-                    file_name: Optional[str] = None, otp_set_name: Optional[str] = None) -> None:
+                    file_name: Optional[str] = None, otp_set_name: Optional[str] = None,
+                    path: str = "whatsapp") -> None:
     """
     Caller must have won _claim_batch(). Always releases the batch state when done.
     For file batches the position is saved after every finished number, so a /stop,
@@ -5286,11 +5471,15 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
     """
     global is_processing, is_paused, current_task, skip_current_number, current_index, \
         total_numbers_count, active_number, active_file_id, stop_requested, jump_requested_index, pause_interrupt, \
-        active_batch_user_id
+        active_batch_user_id, active_path, active_otp_set_name, saved_interjection
 
     total = len(numbers)
     active_batch_user_id = user_id
-    saved_file_run = file_id is not None and file_name == SAVED_FILE_NAME   # Saved.txt always runs on the second device
+    saved_file_run = file_id is not None and _is_saved_file(file_name)    # Saved files always run on the second device
+    if saved_file_run:
+        path = SAVED_FILE_PATHS[file_name]          # SavedWS.txt is the WhatsApp path, SavedTG.txt the Telegram path
+    active_path = path if path in PATH_IDENTIFIERS else "whatsapp"
+    active_otp_set_name = otp_set_name
     completed = start_index
     in_flight = False                  # a number has been started and is not finished yet
     status_msg = None                  # the first "Processing..." message, edited as the batch goes
@@ -5308,10 +5497,10 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             return
 
         if saved_file_run and not MACRODROID_WEBHOOK_URL_1:
-            # Saved.txt only ever runs on the second device: without one the file is left exactly as it is
+            # a Saved file only ever runs on the second device: without one the file is left exactly as it is
             await message.answer(
-                f"❌ {SAVED_FILE_NAME} always runs on the second device, but MACRODROID_WEBHOOK_URL_1 is not set. "
-                f"Set it, then resume {SAVED_FILE_NAME} from /numberfiles. The file is untouched."
+                f"❌ {file_name} always runs on the second device, but MACRODROID_WEBHOOK_URL_1 is not set. "
+                f"Set it, then resume {file_name} from /numberfiles. The file is untouched."
             )
             return
 
@@ -5336,6 +5525,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             if start_index:
                 header += f"\nResuming from number {start_index + 1}"
         header += f"\nOTP group: {_scope_label(otp_set_name)}"
+        header += f"\nPath: {PATH_LABELS[active_path]}"
         status_msg = await message.answer(header)
 
         idx = start_index
@@ -5352,12 +5542,14 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             skip_current_number = False
             in_flight = True
 
+            if saved_interjection is not None:
+                await _run_saved_interjection()      # a Saved file was resumed meanwhile (Save marked): its numbers go first
             if is_paused:
                 await _edit_status(
                     status_msg,
                     f"⏸️ Processing paused\n\nProgress: {idx + 1}/{total}\nTarget: {num}\n/resume restarts this number from its start.",
                 )
-            await pause_event.wait()
+            await _wait_resume_serving_interjections()
             pause_interrupt = False                        # a /pause pressed from here on abandons THIS number
             _raise_if_stopped()
             if jump_requested_index is not None:          # a /jumpto while paused: applied at the top of the loop
@@ -5476,6 +5668,11 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
         active_number = None
         active_file_id = None
         active_batch_user_id = None
+        active_path = "whatsapp"
+        active_otp_set_name = None
+        if saved_interjection is not None:
+            logger.warning("A requested Saved file run was dropped: the batch ended before it could start")
+            saved_interjection = None
         skip_current_number = False
         stop_requested = False
         jump_requested_index = None
@@ -5506,6 +5703,9 @@ async def offer_batch(message: Message, user_id: int, numbers: List[str],
 
 
 def _pending_summary(p: Dict) -> str:
+    if p.get("mode") == "assign_path":
+        return (f"📄 <b>{html.escape(p['file_name'])}</b>: pick the path this file uses from now on. "
+                "It is remembered, and you can change it here anytime.")
     if p.get("mode") == "assign":
         return (f"📄 <b>{html.escape(p['file_name'])}</b>: pick the OTP group this file uses from now on. "
                 "It is remembered, and you can change it here anytime.")
@@ -5639,20 +5839,119 @@ async def otpsel_callback_handler(callback: CallbackQuery):
             await query.edit_message_text("⚠️ That file no longer exists (deleted or expired).")
         return
 
-    if not _claim_batch():
-        await query.answer("⚠️ Another batch is running. Use /stop to stop it first.", show_alert=True)
+    remembered_path = pending.get("path")
+    if remembered_path in PATH_IDENTIFIERS:
+        # the file remembers its path: nothing more to ask
+        if await _launch_batch(callback, query, user_id, pending, otp_set_name, remembered_path):
+            await query.answer()
+            try:
+                await query.edit_message_text(
+                    f"✅ OTP group: <b>{html.escape(_scope_label(otp_set_name))}</b>\n"
+                    f"✅ Path: <b>{PATH_LABELS[remembered_path]}</b>. Starting…",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
         return
 
+    # the group is chosen: now ask which path the numbers go through (nothing is claimed or saved before that)
+    pending["stage"] = "path"
+    pending["otp_set_name"] = otp_set_name
+    pending["ts"] = time.time()
+    await query.answer()
+    text, markup = _build_path_picker_view(pending)
+    await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+async def _launch_batch(callback: CallbackQuery, query, user_id: int, pending: Dict, otp_set_name: Optional[str],
+                        path: str) -> bool:
+    """Starts a batch that has its OTP group and path. A file remembers both. False when another batch is running."""
+    if not _claim_batch():
+        await query.answer("⚠️ Another batch is running. Use /stop to stop it first.", show_alert=True)
+        return False
     pending_batches.pop(user_id, None)
     if pending['file_id'] is not None:
         await db_set_file_scope(user_id, pending['file_id'], otp_set_name)      # the file remembers its group
+        await db_set_file_path(user_id, pending['file_id'], path)               # ... and its path
     _spawn_batch(callback.message, user_id, pending['numbers'], pending['file_id'], pending['start_index'],
-                 pending['file_name'], otp_set_name)
+                 pending['file_name'], otp_set_name, path)
+    return True
 
+
+def _build_path_picker_view(p: Dict, header: Optional[str] = None):
+    lines = []
+    if header:
+        lines += [header, ""]
+    lines += ["🧭 <b>Choose Path</b>", "", _pending_summary(p)]
+    if p.get("mode") != "assign_path":
+        lines.append(f"🤖 OTP group: <b>{html.escape(_scope_label(p.get('otp_set_name')))}</b>")
+    lines += ["", "Choose which path the numbers go through."]
+    keyboard = [
+        [InlineKeyboardButton(label, callback_data=f"pathsel_{key}") for key, label in PATH_LABELS.items()],
+        [InlineKeyboardButton("🔙 Back" if p.get("mode") == "assign_path" else "❌ Cancel", callback_data="pathsel_cancel")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
+@router.callback_query(F.data.startswith("pathsel_"))
+async def pathsel_callback_handler(callback: CallbackQuery):
+    update, context = ptb_from_callback(callback)
+    query = update.callback_query
+    user_id = query.from_user.id
+    action = query.data or ""
+
+    pending = pending_batches.get(user_id)
+    if not pending or pending.get("stage") != "path" or time.time() - pending['ts'] > PENDING_BATCH_TTL:
+        pending_batches.pop(user_id, None)
+        await query.answer("This selection expired. Send your numbers or open /numberfiles again.", show_alert=True)
+        try:
+            await query.edit_message_text("⌛ This selection expired.")
+        except Exception:
+            pass
+        return
+    assign = pending.get("mode") == "assign_path"
+
+    async def back_to_file(notice: Optional[str] = None) -> None:
+        view = await build_file_view(user_id, pending["file_id"], notice)
+        if view:
+            await query.edit_message_text(view[0], reply_markup=view[1], parse_mode="HTML")
+        else:
+            await query.edit_message_text("⚠️ That file no longer exists (deleted or expired).")
+
+    if action == "pathsel_cancel":
+        pending_batches.pop(user_id, None)
+        await query.answer()
+        if assign:
+            await back_to_file()
+        else:
+            await query.edit_message_text("❎ Cancelled. Nothing was started.")
+        return
+
+    path = action[len("pathsel_"):]
+    if path not in PATH_IDENTIFIERS:
+        await query.answer()
+        return
+
+    if assign:
+        pending_batches.pop(user_id, None)
+        if await db_set_file_path(user_id, pending["file_id"], path):
+            await query.answer()
+            await back_to_file(f"✅ This file will use the <b>{PATH_LABELS[path]}</b> path from now on.")
+        else:
+            await query.answer("❌ Could not save the path.", show_alert=True)
+            await back_to_file()
+        return
+
+    otp_set_name = pending.get("otp_set_name")
+    if not await _launch_batch(callback, query, user_id, pending, otp_set_name, path):
+        return
     await query.answer()
     try:
-        await query.edit_message_text(f"✅ OTP group: <b>{html.escape(_scope_label(otp_set_name))}</b>. Starting…",
-                                      parse_mode="HTML")
+        await query.edit_message_text(
+            f"✅ OTP group: <b>{html.escape(_scope_label(otp_set_name))}</b>\n"
+            f"✅ Path: <b>{PATH_LABELS[path]}</b>. Starting…",
+            parse_mode="HTML",
+        )
     except Exception:
         pass
 
@@ -5893,12 +6192,21 @@ async def build_file_view(user_id: int, file_id: int, notice: Optional[str] = No
         group_line = f"🤖 OTP group: <b>{html.escape(_scope_label(rec.get('scope_set_name')))}</b>"
     else:
         group_line = "🤖 OTP group: not chosen yet (you'll be asked when you start)"
+    saved_file = _is_saved_file(rec["name"])
+    path_chosen = rec.get("path") in PATH_IDENTIFIERS
+    if saved_file:
+        path_line = f"🧭 Path: <b>{PATH_LABELS[SAVED_FILE_PATHS[rec['name']]]}</b> (fixed for this file, runs on the second device)"
+    elif path_chosen:
+        path_line = f"🧭 Path: <b>{PATH_LABELS[rec['path']]}</b>"
+    else:
+        path_line = "🧭 Path: not chosen yet (you'll be asked when you start)"
 
     text = (
         f"📄 <b>{html.escape(rec['name'])}</b>\n\n"
         f"🔢 Numbers: {total:,}\n"
         f"📊 Progress: {_file_progress_text(rec)}\n"
         f"{group_line}\n"
+        f"{path_line}\n"
         f"⏳ Expires in: {_fmt_time_left(rec['expires_at'])}\n\n"
         f"{resume_hint}"
     )
@@ -5909,8 +6217,10 @@ async def build_file_view(user_id: int, file_id: int, notice: Optional[str] = No
         [InlineKeyboardButton("▶️ Resume", callback_data=f"nf_resume_{file_id}"),
          InlineKeyboardButton("🗑 Delete", callback_data=f"nf_del_{file_id}")],
         [InlineKeyboardButton("🤖 Change OTP group" if chosen else "🤖 Choose OTP group", callback_data=f"nf_group_{file_id}")],
-        [InlineKeyboardButton("🔙 Back", callback_data=f"nf_page_{page}")],
     ]
+    if not saved_file:
+        keyboard.append([InlineKeyboardButton("🧭 Change Path" if path_chosen else "🧭 Choose Path", callback_data=f"nf_path_{file_id}")])
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data=f"nf_page_{page}")])
     return text, InlineKeyboardMarkup(keyboard)
 
 
@@ -5988,6 +6298,9 @@ async def nf_callback_handler(callback: CallbackQuery):
             return
 
         if is_processing:
+            # a Saved file with Save marked in /setaction: the running batch is paused, 2 of its numbers run, it carries on
+            if await _request_saved_interjection(callback, query, user_id, rec):
+                return
             await query.answer("⚠️ Another batch is running. Use /stop to stop it first.", show_alert=True)
             return
 
@@ -5998,30 +6311,38 @@ async def nf_callback_handler(callback: CallbackQuery):
 
         start = rec["next_index"] if 0 < rec["next_index"] < rec["total"] else 0
         notice = None
+        remembered_path = SAVED_FILE_PATHS.get(rec["name"]) or (rec.get("path") if rec.get("path") in PATH_IDENTIFIERS else None)
         if rec.get("scope_chosen"):
             saved_name = rec.get("scope_set_name")
             if saved_name is None or any(x["name"] == saved_name for x in await db_get_otp_sets(user_id)):
-                # the file remembers its OTP group: no picker, it just starts
-                if not _claim_batch():
-                    await query.answer("⚠️ Another batch is running. Use /stop to stop it first.", show_alert=True)
+                pending = dict(numbers=rec["numbers"], file_id=rec["id"], start_index=start, file_name=rec["name"],
+                               ts=time.time(), stage="path", otp_set_name=saved_name, path=remembered_path)
+                if remembered_path:
+                    # the file remembers its OTP group and its path: no picker, it just starts
+                    if not await _launch_batch(callback, query, user_id, pending, saved_name, remembered_path):
+                        return
+                    await query.answer()
+                    where = f"from number {start + 1}" if start else "from the beginning"
+                    try:
+                        await query.edit_message_text(
+                            f"▶️ <b>{html.escape(rec['name'])}</b>: resuming {where} • OTP group: "
+                            f"<b>{html.escape(_scope_label(saved_name))}</b> • Path: <b>{PATH_LABELS[remembered_path]}</b>",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
                     return
-                _spawn_batch(callback.message, user_id, rec["numbers"], rec["id"], start, rec["name"], saved_name)
+                # the file has no path yet: only that is asked
+                pending_batches[user_id] = pending
                 await query.answer()
-                where = f"from number {start + 1}" if start else "from the beginning"
-                try:
-                    await query.edit_message_text(
-                        f"▶️ <b>{html.escape(rec['name'])}</b>: resuming {where} • OTP group: "
-                        f"<b>{html.escape(_scope_label(saved_name))}</b>",
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
+                text, markup = _build_path_picker_view(pending)
+                await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
                 return
             # the saved group was deleted or renamed: forget it and ask again
             await db_set_file_scope(user_id, rec["id"], None, chosen=False)
             notice = f"⚠️ The saved OTP group “{html.escape(saved_name)}” no longer exists. Pick another one."
         pending_batches[user_id] = dict(numbers=rec["numbers"], file_id=rec["id"], start_index=start,
-                                        file_name=rec["name"], ts=time.time())
+                                        file_name=rec["name"], ts=time.time(), path=remembered_path)
         await query.answer()
         text, markup = await build_otp_picker_view(user_id, 0, notice)
         await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
@@ -6040,6 +6361,22 @@ async def nf_callback_handler(callback: CallbackQuery):
         pending_batches[user_id] = dict(mode="assign", file_id=rec["id"], file_name=rec["name"], numbers=[], start_index=0,
                                         current=(bool(rec.get("scope_chosen")), rec.get("scope_set_name")), ts=time.time())
         text, markup = await build_otp_picker_view(user_id, 0)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
+    elif action.startswith("nf_path_"):
+        fid = file_id_from("nf_path_")
+        rec = await db_get_number_file(user_id, fid) if fid is not None else None
+        if not rec:
+            await query.answer()
+            await show_list(context.user_data.get('nf_page', 0), "⚠️ That file no longer exists (deleted or expired).")
+            return
+        if _is_saved_file(rec["name"]):
+            await query.answer(f"The path of {rec['name']} is fixed.", show_alert=True)
+            return
+        await query.answer()
+        pending_batches[user_id] = dict(mode="assign_path", stage="path", file_id=rec["id"], file_name=rec["name"],
+                                        numbers=[], start_index=0, ts=time.time())
+        text, markup = _build_path_picker_view(pending_batches[user_id])
         await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
 
     elif action.startswith("nf_delyes_"):
