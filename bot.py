@@ -236,9 +236,6 @@ _SCHEMA_STATEMENTS = [
     ("number_files.scope_set_name", "ALTER TABLE number_files ADD COLUMN IF NOT EXISTS scope_set_name TEXT"),
     # files made before the path (WhatsApp / Telegram) was remembered per file: NULL = not chosen yet
     ("number_files.path", "ALTER TABLE number_files ADD COLUMN IF NOT EXISTS path TEXT"),
-    # Saved.txt is renamed to SavedWS.txt (the WhatsApp path's saved numbers) on every startup. Temporary: remove when asked.
-    ("rename Saved.txt", "UPDATE number_files SET name = 'SavedWS.txt', path = 'whatsapp' WHERE name = 'Saved.txt' "
-                         "AND NOT EXISTS (SELECT 1 FROM number_files f WHERE f.user_id = number_files.user_id AND f.name = 'SavedWS.txt')"),
     # prevents duplicate set names per user (add_otp_set relies on this)
     ("ux_otp_groups_user_name", "CREATE UNIQUE INDEX IF NOT EXISTS ux_otp_groups_user_name ON otp_groups (user_id, name)"),
 ]
