@@ -48,6 +48,10 @@ MACRODROID_WEBHOOK_URL = os.getenv(
 # <link>/whatsapp_path or <link>/telegram_path, so the same device link serves both paths.
 PATH_IDENTIFIERS = {"whatsapp": "whatsapp_path", "telegram": "telegram_path"}
 PATH_LABELS = {"whatsapp": "WhatsApp", "telegram": "Telegram"}
+# Telegram path: the emails the device asks for (type=email), comma separated, used one by one in a circle across numbers
+EMAILS = [e.strip() for e in os.getenv("EMAILS", "").split(",") if e.strip()]
+TELEGRAM_CODE_LENGTH = 5               # the Telegram path looks for a 5-digit code (WhatsApp: 6)
+email_counter = 0                      # how many emails were handed out; email_counter % len(EMAILS) is the next one
 # second device's webhook: when the device sends the "action" status and the marked /setaction option is Switch, the
 # current number restarts from type=check on the other device (this URL), and every later webhook call for that
 # number goes there. Numbers of the Saved files always run on this device. Also the link without identifier.
@@ -382,6 +386,117 @@ def parse_phone_number(raw_number: str):
     return "", cleaned[1:]
 
 
+# ---- waittime: the device can ask the ongoing number to wait (waittime=2m30s / 3m / 45s). Everything the number does is
+# held and all its timers stand still, because they run on this clock, which does not count the waits.
+clock_offset = 0.0            # seconds of finished waits of the current number
+wait_started = 0.0            # real time the wait in progress began
+wait_end = 0.0                # real time it ends (0 = no wait in progress)
+wait_generation = 0
+current_num_msg = None        # the message of the number being processed (the wait is shown there)
+current_num: Optional[str] = None
+
+
+def _clock() -> float:
+    """The current number's own clock: real time minus the time spent in waittime waits (stands still during one)."""
+    global clock_offset, wait_started, wait_end
+    now = time.time()
+    if wait_end:
+        if now < wait_end:
+            return wait_started - clock_offset
+        clock_offset += wait_end - wait_started
+        wait_started = wait_end = 0.0
+    return now - clock_offset
+
+
+def _reset_number_clock() -> None:
+    global clock_offset, wait_started, wait_end
+    clock_offset = wait_started = wait_end = 0.0
+
+
+_WAITTIME_RE = re.compile(r"^\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?\s*$", re.IGNORECASE)
+
+
+def _parse_wait_time(raw: str) -> Optional[int]:
+    """'2m30s' -> 150, '3m' -> 180, '45s' -> 45. None when it is not Xm, Xs or XmXs."""
+    match = _WAITTIME_RE.match(raw or "")
+    if not match or (match.group(1) is None and match.group(2) is None):
+        return None
+    total = int(match.group(1) or 0) * 60 + int(match.group(2) or 0)
+    return total if total > 0 else None
+
+
+def _format_wait_time(seconds: int) -> str:
+    minutes, secs = divmod(int(seconds), 60)
+    return (f"{minutes}m" if minutes else "") + (f"{secs}s" if secs or not minutes else "")
+
+
+def _begin_device_wait(seconds: float) -> float:
+    """Starts (or extends) the wait of the ongoing number. Returns how many seconds it was extended by."""
+    global wait_started, wait_end
+    _clock()                                  # folds a finished wait in first
+    now = time.time()
+    if wait_end and now < wait_end:
+        new_end = max(wait_end, now + seconds)
+        added = new_end - wait_end
+        wait_end = new_end
+        return added
+    wait_started, wait_end = now, now + seconds
+    return float(seconds)
+
+
+async def _hold_for_device_wait() -> None:
+    """The device asked the ongoing number to wait: nothing is done for it until the wait is over."""
+    while wait_end and time.time() < wait_end:
+        _raise_if_stopped()
+        if skip_current_number or pause_interrupt:
+            return
+        await asyncio.sleep(min(1.0, max(0.05, wait_end - time.time())))
+
+
+async def _wait_over_notice(generation: int, msg, num: str) -> None:
+    """When the wait is over the number's message stops saying it is waiting."""
+    while wait_end and time.time() < wait_end:
+        await asyncio.sleep(min(1.0, max(0.05, wait_end - time.time())))
+    if generation == wait_generation and current_num_msg is msg:
+        try:
+            await msg.edit_text(f"{num} ⏳ Wait over. Continuing...")
+        except Exception:
+            pass
+
+
+async def _start_number_wait(seconds: int) -> bool:
+    """A waittime arrived: the ongoing number waits (timers included). False when no number is being processed."""
+    global wait_generation
+    if current_num_msg is None or current_num is None:
+        return False
+    device_ack_event.set()                    # the device answered: no more no-response retries
+    added = _begin_device_wait(seconds)
+    if active_batch_user_id is not None and added > 0:
+        await otp_search_manager.extend_user_searches(active_batch_user_id, added)   # a running code search waits too
+    wait_generation += 1
+    msg, num = current_num_msg, current_num
+    try:
+        await msg.edit_text(f"{num} ⏰ Waiting {_format_wait_time(seconds)}")
+    except Exception:
+        pass
+    asyncio.ensure_future(_wait_over_notice(wait_generation, msg, num))
+    return True
+
+
+def _next_email() -> Optional[str]:
+    """The next email of EMAILS, circling around (1st, 2nd, 3rd, 1st, ...). None when EMAILS is empty."""
+    global email_counter
+    if not EMAILS:
+        return None
+    email = EMAILS[email_counter % len(EMAILS)]
+    email_counter += 1
+    return email
+
+
+def _telegram_path() -> bool:
+    return active_path == "telegram"
+
+
 def _is_saved_file(name: Optional[str]) -> bool:
     """SavedWS.txt (WhatsApp path) and SavedTG.txt (Telegram path): the files the Save action fills."""
     return name in SAVED_FILE_PATHS
@@ -394,7 +509,7 @@ def _webhook_for_path(base_url: str, path: str) -> str:
 
 
 async def call_device_api(raw_number: str, payload_type: str = "check", code: str | None = None,
-                          link_code: str | None = None):
+                          link_code: str | None = None, email: str | None = None):
     country_code, national_number = parse_phone_number(raw_number)
 
     # every call of a number goes to the device the number is on: the normal one until a "switch" status moves it
@@ -416,6 +531,8 @@ async def call_device_api(raw_number: str, payload_type: str = "check", code: st
         url += f"&code={code}"
     if link_code:
         url += f"&link_code={quote(link_code, safe='')}"       # type=link: the code the Pair chat showed
+    if email:
+        url += f"&email={quote(email, safe='@')}"              # type=email: Telegram path
 
     logger.info("Triggering MacroDroid %s%s -> +%s %s [%s]", active_path, " (second device)" if on_second else "",
                 country_code, national_number, payload_type)
@@ -708,9 +825,13 @@ class OTPFormatParser:
         return result
     
     @staticmethod
-    def extract_otp(text: str) -> Optional[str]:
+    def extract_otp(text: str, length: int = 6) -> Optional[str]:
         if not text:
             return None
+        if length != 6:
+            # another code length (Telegram path: 5 digits): a standalone run of exactly that many digits
+            match = re.search(rf'(?<!\d)\d{{{length}}}(?!\d)', text)
+            return match.group(0) if match else None
         
         dash_pattern = r'(\d{3})-(\d{3})'
         for dash_match in re.finditer(dash_pattern, text):
@@ -1556,7 +1677,7 @@ class AutoOTPSearchManager:
     async def start_search(self, user_id: int, search_key: str, extracted_number: str,
                            task_label: str = "", set_name: Optional[str] = None,
                            duration: Optional[float] = None,
-                           exclude_otps: Optional[Set[str]] = None) -> Optional[asyncio.Future]:
+                           exclude_otps: Optional[Set[str]] = None, code_length: int = 6) -> Optional[asyncio.Future]:
         """
         Registers a search and returns a future that resolves to
         (otp, set_name) when found, or None when the search times out / is cancelled.
@@ -1599,6 +1720,7 @@ class AutoOTPSearchManager:
                 'start_time':       time.time(),
                 'end_time':         time.time() + (duration if duration is not None else OTP_SEARCH_DURATION),
                 'exclude':          set(exclude_otps or ()),   # codes already sent for this number
+                'code_length':      code_length,               # 6 (WhatsApp) or 5 (Telegram path)
                 'cancelled':        False,
                 'found_otp':        False,
                 'future':           future,
@@ -1681,7 +1803,7 @@ class AutoOTPSearchManager:
 
                         for pattern in patterns:
                             if pattern in msg_text:
-                                otp = OTPFormatParser.extract_otp(extract_full_message(message))
+                                otp = OTPFormatParser.extract_otp(extract_full_message(message), search_info.get('code_length', 6))
                                 if otp and otp.replace('-', '') not in search_info['exclude']:
                                     logger.info(
                                         f"✅ [Backfill] OTP '{otp}' found in group {group_id} "
@@ -1704,8 +1826,10 @@ class AutoOTPSearchManager:
         if not search_info:
             return
 
-        wait = search_info['end_time'] - time.time()
-        if wait > 0:
+        while True:
+            wait = search_info['end_time'] - time.time()      # end_time can be pushed back by a waittime meanwhile
+            if wait <= 0:
+                break
             await asyncio.sleep(wait)
 
         if search_key in self.active_searches and self.searches.get(search_key) is search_info:
@@ -1742,7 +1866,7 @@ class AutoOTPSearchManager:
                     if not pattern or pattern not in msg_text:
                         continue
 
-                    otp = OTPFormatParser.extract_otp(extract_full_message(message))
+                    otp = OTPFormatParser.extract_otp(extract_full_message(message), search_info.get('code_length', 6))
                     if otp and otp.replace('-', '') not in search_info['exclude']:
                         logger.info(
                             f"✅ [Live] OTP '{otp}' found for {search_key} "
@@ -1772,6 +1896,12 @@ class AutoOTPSearchManager:
 
             self.searches.pop(search_key, None)
             self._key_locks.pop(search_key, None)
+
+    async def extend_user_searches(self, user_id: int, seconds: float):
+        """A waittime pushed the number's clock back: its running code search gets the same time added."""
+        for info in list(self.searches.values()):
+            if info.get('user_id') == user_id and not info.get('cancelled') and not info.get('found_otp'):
+                info['end_time'] += seconds
 
     async def cancel_search(self, search_key: str):
         async with self._get_key_lock(search_key):
@@ -2025,14 +2155,15 @@ async def _flush_wscodes(user_id: int, target_chat, key: tuple) -> None:
 
 
 def _wscode_summary(key: tuple) -> str:
-    """Explains a chat timeout from the wscode side."""
+    """Explains a chat timeout from the wscode side (tgcode on the Telegram path)."""
+    label = "tgcode" if _telegram_path() else "wscode"
     st = live_wscode_state.get(key)
     if not st or not st["received"]:
-        return "\nwscode: no code came back from the device."
+        return f"\n{label}: no code came back from the device."
     pending = st["received"] - st["replied"]
     if not pending:
-        return f"\nwscode: {st['replied']} code(s) sent as a reply."
-    return f"\nwscode: {st['replied']} sent, {pending} not sent (the chat sent no message to reply to)."
+        return f"\n{label}: {st['replied']} code(s) sent as a reply."
+    return f"\n{label}: {st['replied']} sent, {pending} not sent (the chat sent no message to reply to)."
 
 
 def _forget_device_status() -> None:
@@ -3875,7 +4006,7 @@ async def start_handler(message: Message):
         "How it works:\n"
         "1) /login and complete the interactive login flow\n"
         "2) /otpgroups to add OTP sets, e.g. HK = 2|TGT|3 = -100123456789\n"
-        "3) Send numbers as text, or send a .txt file, then pick which OTP group to search (or All Groups), then choose the path: WhatsApp (MacroDroid identifier whatsapp_path) or Telegram (telegram_path). Files are saved while you are logged in, so you can resume them. A file remembers the OTP group and the path you picked (change them from the file's menu in /numberfiles)\n"
+        "3) Send numbers as text, or send a .txt file, then pick which OTP group to search (or All Groups), then choose the path: WhatsApp (MacroDroid identifier whatsapp_path) or Telegram (telegram_path). The Telegram path runs on the second device only: it sends the email the device asks for (EMAILS, in a circle), then a 5-digit code from the selected OTP group(s), then the number goes to the chat and the device is asked for its tgcode; blocked is Bad Num, registered is 🟤 Already Registered (unavailable, error and action are not used on this path for now). Any path: if the device sends waittime=Xm, Xs or XmXs, the ongoing number waits that long (⏰ Waiting), all its timers on hold. Files are saved while you are logged in, so you can resume them. A file remembers the OTP group and the path you picked (change them from the file's menu in /numberfiles)\n"
         "4) If the device requests a code, the bot searches your OTP groups (short backfill + live handlers) "
         f"for the number-derived pattern and sends the OTP it finds to the device. After {NO_CODE_AFTER_SECONDS}s without a code the "
         "device gets no_code and the search keeps going. blocked / unavailable / try_again end the number at any point (unavailable is handled like Bad Num but shown as 🟤 Unavailable). If the device sends action (before it has continued), the option marked in /setaction decides: Switch restarts that number from type=check on the other device (MACRODROID_WEBHOOK_URL_1), with fresh timers, and all its calls go there (every new number starts on the normal device); Save keeps the number in SavedWS.txt (WhatsApp path) or SavedTG.txt (Telegram path), always processed on the second device with the file's own path (48h refreshed on every save), and moves to the next number; with none marked, action does nothing.\n"
@@ -4669,6 +4800,8 @@ def _effective_action() -> Optional[str]:
     marked in /setaction for the user whose batch is running. Switch also does nothing without a second webhook,
     and for numbers of the Saved files (they never leave the second device).
     """
+    if _telegram_path():
+        return None                     # the Telegram path has no action for now
     action = user_device_actions.get(active_batch_user_id) if active_batch_user_id is not None else None
     if action == "switch" and (not MACRODROID_WEBHOOK_URL_1 or second_device_only):
         return None
@@ -4692,8 +4825,10 @@ def _search_interrupt_from_status() -> Optional[str]:
         return action
     if "blocked" in status:
         return "blocked"
-    if "unavailable" in status:
-        return "unavailable"            # counts as Bad Num (and towards the unavailable-in-a-row pause)
+    if _telegram_path() and "registered" in status:
+        return "registered"             # Telegram path: the number is already registered
+    if "unavailable" in status and not _telegram_path():
+        return "unavailable"            # counts as Bad Num (and towards the unavailable-in-a-row pause); not on the Telegram path for now
     if "try_again" in status:
         return "try_again"
     return None
@@ -4712,8 +4847,8 @@ def _device_outcome_from_status() -> Optional[str]:
     return None
 
 
-def _device_state_from_status() -> Optional[str]:
-    """What the device answered after we sent it a code."""
+def _device_state_from_status(want_request: bool = False) -> Optional[str]:
+    """What the device answered after we sent it a code (or an email: want_request also reports request_email / request_code)."""
     if pause_interrupt:
         return "pause"
     status = (device_status or "").lower()
@@ -4722,31 +4857,40 @@ def _device_state_from_status() -> Optional[str]:
         return action
     if "blocked" in status:
         return "blocked"
-    if "unavailable" in status:
+    if _telegram_path() and "registered" in status:
+        return "registered"
+    if "unavailable" in status and not _telegram_path():       # not expected on the Telegram path for now
         return "unavailable"
     if "try_again" in status:
         return "try_again"
     outcome = _device_outcome_from_status()
     if outcome:
         return outcome                  # success / failure straight from the device, no continue needed
-    if "error" in status and "request_code" not in status:
+    if want_request:                    # email stage only: what the device asks for next
+        if "request_email" in status:
+            return "request_email"
+        if "request_code" in status:
+            return "request_code"
+    if "error" in status and "request_code" not in status and not _telegram_path():     # not on the Telegram path for now
         return "error"
     if "continue" in status or "proceed" in status:
         return "continue"
     return None
 
 
-async def _wait_device_state(deadline: float) -> str:
+async def _wait_device_state(deadline: float, want_request: bool = False) -> str:
     """Waits (inside the shared device budget) until the device answers.
-    Returns switch | save | blocked | unavailable | try_again | success | failure | error | continue | skip | timeout. Other callbacks are ignored."""
+    Returns switch | save | blocked | registered | unavailable | try_again | success | failure | error | continue | skip | timeout
+    (and request_email | request_code with want_request). Other callbacks are ignored."""
     while True:
+        await _hold_for_device_wait()
         _raise_if_stopped()
-        state = _device_state_from_status()
+        state = _device_state_from_status(want_request)
         if state:
             return state
         if skip_current_number:
             return "skip"
-        remaining = deadline - time.time()
+        remaining = deadline - _clock()
         if remaining <= 0:
             return "timeout"
         device_event.clear()
@@ -4767,11 +4911,12 @@ async def _search_for_otp(num_msg, user_id: int, num: str, otp_set_name: Optiona
     fut = await otp_search_manager.start_search(
         user_id, search_key, num, task_label="batch", set_name=otp_set_name,
         duration=duration, exclude_otps=exclude,
+        code_length=TELEGRAM_CODE_LENGTH if _telegram_path() else 6,
     )
     if fut is None:
         return {"outcome": "nopattern", "scope_label": scope_label}
 
-    started = time.time()
+    started = _clock()
     deadline = started + duration + 5
     if hard_deadline is not None:
         deadline = min(deadline, hard_deadline)
@@ -4782,12 +4927,13 @@ async def _search_for_otp(num_msg, user_id: int, num: str, otp_set_name: Optiona
     device_status = None
     try:
         while True:
+            await _hold_for_device_wait()
             _raise_if_stopped()
             interrupt = _search_interrupt_from_status()
-            if interrupt or fut.done() or skip_current_number or time.time() >= deadline:
+            if interrupt or fut.done() or skip_current_number or _clock() >= deadline:
                 break
 
-            if not no_code_sent and time.time() >= no_code_at:
+            if not no_code_sent and _clock() >= no_code_at:
                 no_code_sent = True
                 await num_msg.edit_text(
                     f"{num} ⚪ No code after {NO_CODE_AFTER_SECONDS}s. Still searching ({scope_label})..."
@@ -4801,7 +4947,7 @@ async def _search_for_otp(num_msg, user_id: int, num: str, otp_set_name: Optiona
             try:
                 await asyncio.wait(
                     {fut, waiter},
-                    timeout=max(0.0, wake_at - time.time()),
+                    timeout=max(0.0, wake_at - _clock()),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             finally:
@@ -4836,7 +4982,7 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
     await num_msg.edit_text(f"{num} ⚪ Device requested code. Searching OTP groups ({scope_label})...")
 
     sent_codes: Set[str] = set()
-    duration = min(OTP_SEARCH_DURATION, max(0.0, device_deadline - time.time()))
+    duration = min(OTP_SEARCH_DURATION, max(0.0, device_deadline - _clock()))
 
     async def finish(text: str, status: str, timed_out: bool = False, details: Optional[str] = None,
                      ret: Optional[str] = None) -> str:
@@ -4862,7 +5008,7 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
     async def saved() -> str:
         return await _device_save(num_msg, user_id, num)
 
-    if device_deadline - time.time() <= 0:
+    if device_deadline - _clock() <= 0:
         return await finish(f"🟠 Ended (Device timeout - {DEVICE_STATE_WAIT_SECONDS // 60} mins)", "device_timeout", timed_out=True)
 
     while True:
@@ -4877,6 +5023,8 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
             return await saved()
         if outcome == "blocked":
             return await finish("⚫ Bad Num", "blocked")
+        if outcome == "registered":
+            return await finish("🟤 Already Registered", "registered")
         if outcome == "unavailable":
             return await unavailable()
         if outcome == "try_again":
@@ -4920,6 +5068,8 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
             return await saved()
         if state == "blocked":
             return await finish("⚫ Bad Num", "blocked")
+        if state == "registered":
+            return await finish("🟤 Already Registered", "registered")
         if state == "unavailable":
             return await unavailable()
         if state == "try_again":
@@ -4930,11 +5080,75 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
             return await finish(f"🟠 Ended (Device timeout after sending code - {DEVICE_STATE_WAIT_SECONDS // 60} mins)", "device_timeout_after_code", timed_out=True)
 
         # state == "error": look for a new code, still inside the same device state wait
-        remaining = device_deadline - time.time()
+        remaining = device_deadline - _clock()
         if remaining <= 0:
             return await finish(f"🟠 Ended (Device timeout after sending code - {DEVICE_STATE_WAIT_SECONDS // 60} mins)", "device_timeout_after_code", timed_out=True)
         await num_msg.edit_text(f"{num} 🔁 Device reported an error. Rechecking OTP ({scope_label})...")
         duration = min(OTP_SEARCH_DURATION, remaining)
+
+
+async def _email_stage(num_msg, user_id: int, num: str, device_deadline: float) -> str:
+    """
+    Telegram path: the device asked for an email. Sends the next one of EMAILS (round robin) and waits for the device:
+      request_code  -> "request_code" (the caller goes on to the OTP search)
+      request_email -> asks again: the next email of the circle goes out
+      blocked / registered / try_again / unavailable at any point -> the number ends here
+    Returns "request_code", "continue", "result", "timeout", "pause", "skipped", "unavailable", "saved" or "ended".
+    """
+    global device_status
+
+    async def finish(text: str, status: str, timed_out: bool = False, ret: Optional[str] = None) -> str:
+        await num_msg.edit_text(f"{num} {text}")
+        await log_number_status(num, status)
+        if timed_out:
+            return "timeout"
+        return ret or ("skipped" if status == "skipped" else "ended")
+
+    while True:
+        email = _next_email()
+        if not email:
+            return await finish("🔴 No emails set (EMAILS). Skipping.", "no_emails")
+        _raise_if_stopped()
+        device_event.clear()
+        device_status = None
+        await num_msg.edit_text(f"{num} ⚪ Device requested an email. Sending {email}...")
+        if not await call_device_api(num, payload_type="email", email=email):
+            await num_msg.edit_text(f"{num} 🔴 Error (Webhook failed)")
+            await log_number_status(num, "webhook_error", "email")
+            return "ended"
+
+        state = await _wait_device_state(device_deadline, want_request=True)
+        if state == "request_code":
+            return "request_code"
+        if state == "request_email":
+            continue                                    # the device wants another email: the next one of the circle
+        if state == "continue":
+            return "continue"
+        if state in ("success", "failure"):
+            await num_msg.edit_text(f"{num} 🟢 Success" if state == "success" else f"{num} 🟠 Failure")
+            await log_number_status(num, state, "from device")
+            return "result"
+        if state == "skip":
+            return await finish("⏭️ Skipped", "skipped")
+        if state == "save":
+            return await _device_save(num_msg, user_id, num)
+        if state == "switch":
+            return await finish("🟣 Switched", "switch", ret="switch")
+        if state == "pause":
+            await _device_pause_notice(num_msg, num)
+            return "pause"
+        if state == "blocked":
+            return await finish("⚫ Bad Num", "blocked")
+        if state == "registered":
+            return await finish("🟤 Already Registered", "registered")
+        if state == "unavailable":
+            return await finish("🟤 Unavailable", "unavailable", ret="unavailable")
+        if state == "try_again":
+            return await finish("🟡 Try Later", "try_again")
+        if state == "timeout":
+            return await finish(f"🟠 Ended (Device timeout after sending email - {DEVICE_STATE_WAIT_SECONDS // 60} mins)",
+                                "device_timeout_after_email", timed_out=True)
+        return await finish("🔴 Error Code", "error")
 
 
 def _human_secs(seconds: float) -> str:
@@ -5030,6 +5244,9 @@ async def _request_saved_interjection(callback: CallbackQuery, query, user_id: i
     if not MACRODROID_WEBHOOK_URL_1:
         await query.answer(f"{file_name} always runs on the second device, but MACRODROID_WEBHOOK_URL_1 is not set.",
                            show_alert=True)
+        return True
+    if SAVED_FILE_PATHS[file_name] == "telegram" and not EMAILS:
+        await query.answer("The Telegram path needs emails for the device, but EMAILS is empty.", show_alert=True)
         return True
     if saved_interjection is not None or saved_interjection_running:
         await query.answer("A Saved file is already queued to run.", show_alert=True)
@@ -5156,25 +5373,26 @@ async def _wait_first_device_answer(num_msg, num: str, check_sent_at: float, dea
     retries = 0
     window_start = check_sent_at
     while True:
-        remaining = deadline - time.time()
+        await _hold_for_device_wait()
+        remaining = deadline - _clock()
         if remaining <= 0:
             return False
         # any callback from the device ends the retrying, even an "action" the bot ignores (nothing marked in /setaction)
         acked = device_ack_event.is_set()
         retry_at = window_start + RETRY_AFTER_SECONDS if (retries < RETRY_MAX and not acked) else None
-        timeout = remaining if retry_at is None else min(remaining, max(0.0, retry_at - time.time()))
+        timeout = remaining if retry_at is None else min(remaining, max(0.0, retry_at - _clock()))
         await _wait_any([device_event] if acked else [device_event, device_ack_event], timeout)
         if device_event.is_set():
             return True
         _raise_if_stopped()
         if device_ack_event.is_set():
             continue        # the device did respond (just not with something the bot acts on): no more retries
-        if retry_at is not None and time.time() >= retry_at - 0.001 and deadline - time.time() > 0:
+        if retry_at is not None and _clock() >= retry_at - 0.001 and deadline - _clock() > 0:
             retries += 1
             await num_msg.edit_text(f"{num} ⏳ No response from the device. Retry {retries}/{RETRY_MAX} sent...")
             if not await call_device_api(num, payload_type="retry"):
                 logger.warning(f"Could not send retry {retries} for {num}")
-            window_start = time.time()      # the next RETRY_AFTER_SECONDS of silence are counted from this retry
+            window_start = _clock()      # the next RETRY_AFTER_SECONDS of silence are counted from this retry
 
 
 async def _process_number_once(message: Message, user_id: int, target_chat: Optional[int], num: str,
@@ -5191,13 +5409,15 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
     number went to a Saved file, no clear), "unavailable" when the device said unavailable (ended as Bad Num, no
     clear; the batch counts these in a row), and None for every other ending.
     """
-    global device_status
+    global device_status, current_num_msg, current_num
     num_msg = await message.answer(f"{num} ⏳ Checking on device...")
+    _reset_number_clock()
+    current_num_msg, current_num = num_msg, num      # a waittime from the device shows (and waits) here
 
     device_event.clear()
     device_ack_event.clear()
     device_status = None
-    check_sent_at = time.time()      # the timers (retry, no_code, the device budget) all start from here
+    check_sent_at = _clock()      # the timers (retry, no_code, the device budget) all start from here
     device_deadline = check_sent_at + DEVICE_STATE_WAIT_SECONDS   # one shared budget for all waiting on the device
 
     success = await call_device_api(num, payload_type="check")
@@ -5240,7 +5460,12 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
         await log_number_status(num, "blocked")
         return
 
-    if "unavailable" in result_text:
+    if _telegram_path() and "registered" in result_text:
+        await num_msg.edit_text(f"{num} 🟤 Already Registered")
+        await log_number_status(num, "registered")
+        return
+
+    if "unavailable" in result_text and not _telegram_path():
         # handled like Bad Num but shown and logged as Unavailable; the batch counts how many came in a row
         await num_msg.edit_text(f"{num} 🟤 Unavailable")
         await log_number_status(num, "unavailable")
@@ -5251,12 +5476,19 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
         await log_number_status(num, "try_again")
         return
 
-    if "error" in result_text and "request_code" not in result_text:
+    if "error" in result_text and "request_code" not in result_text and not _telegram_path():
         await num_msg.edit_text(f"{num} 🔴 Error Code")
         await log_number_status(num, "error")
         return
 
-    if "request_code" in result_text or "requestcode" in result_text or "request-code" in result_text:
+    if _telegram_path() and "request_email" in result_text:
+        # Telegram path: email first, then the device asks for the code
+        stage = await _email_stage(num_msg, user_id, num, device_deadline)
+        if stage == "request_code":
+            stage = await _otp_stage(num_msg, user_id, num, otp_set_name, device_deadline)
+        if stage != "continue":
+            return stage if stage in ("timeout", "result", "pause", "skipped", "unavailable", "switch", "saved") else None
+    elif "request_code" in result_text or "requestcode" in result_text or "request-code" in result_text:
         stage = await _otp_stage(num_msg, user_id, num, otp_set_name, device_deadline)
         if stage != "continue":
             return stage if stage in ("timeout", "result", "pause", "skipped", "unavailable", "switch", "saved") else None
@@ -5330,16 +5562,16 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
             else:
                 arm_wscode(key, sent_id)
 
-            result_deadline = time.time() + RESULT_WAIT_SECONDS
+            result_deadline = _clock() + RESULT_WAIT_SECONDS
 
             if not pair:
-                # Sell: the number is in the chat: ask the device for its code (wscode). If it sends one back it is
-                # replied to the chat's latest message while we keep waiting; if it never does, we simply follow the
-                # wait time. Pair sends nothing to the device until the chat shows its code.
-                await call_device_api(num, payload_type="wscode")
+                # Sell: the number is in the chat: ask the device for its code (wscode; on the Telegram path tgcode).
+                # If it sends one back it is replied to the chat's latest message while we keep waiting; if it never
+                # does, we simply follow the wait time. Pair sends nothing to the device until the chat shows its code.
+                await call_device_api(num, payload_type="tgcode" if _telegram_path() else "wscode")
         else:
             # no target chat: nothing is forwarded, but success / failure from the device still ends the number
-            result_deadline = time.time() + RESULT_WAIT_SECONDS
+            result_deadline = _clock() + RESULT_WAIT_SECONDS
 
         def wake_event() -> asyncio.Event:
             return link_st["wake"] if link_st is not None else live_wscode_state[key]["wake"]
@@ -5349,6 +5581,7 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
         skipped = False
         device_outcome = None
         while True:
+            await _hold_for_device_wait()
             _raise_if_stopped()
             if link_st is not None and not link_sent and link_st["code"] is not None:
                 # Pair: the first code the chat showed goes to the device, once, as type=link with link_code
@@ -5372,7 +5605,7 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
             if skip_current_number:          # /next (or /jumpto) while waiting for the result
                 skipped = True
                 break
-            if result_deadline - time.time() <= 0:
+            if result_deadline - _clock() <= 0:
                 break
             if target_chat and not pair:
                 await _flush_wscodes(user_id, target_chat, key)
@@ -5385,7 +5618,7 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
             if skip_current_number:
                 skipped = True
                 break
-            await _wait_any([ev, wake_event(), device_event], result_deadline - time.time())
+            await _wait_any([ev, wake_event(), device_event], result_deadline - _clock())
             wake_event().clear()
             if device_event.is_set() and (not gate["gate_open"] or _device_outcome_from_status() is None):
                 device_event.clear()         # not an outcome that counts (yet): don't spin on it
@@ -5444,17 +5677,21 @@ async def process_number(message: Message, user_id: int, target_chat: Optional[i
     beginning on the other device: a fresh type=check, fresh timers, as if it had just started. Every call for the
     number goes to the device it is on, so the final clear also reaches that device. Another switch moves it back.
     """
-    global use_second_url, second_device_only
+    global use_second_url, second_device_only, current_num_msg, current_num
     second_device_only = start_on_second
     use_second_url = start_on_second
-    while True:
-        outcome = await _process_number_once(message, user_id, target_chat, num, otp_set_name, chat_mode)
-        if outcome != "switch":
-            return outcome
-        if skip_current_number:
-            return "skipped"
-        use_second_url = not use_second_url
-        logger.info("Switching %s to the %s device", num, "second" if use_second_url else "normal")
+    try:
+        while True:
+            outcome = await _process_number_once(message, user_id, target_chat, num, otp_set_name, chat_mode)
+            if outcome != "switch":
+                return outcome
+            if skip_current_number:
+                return "skipped"
+            use_second_url = not use_second_url
+            logger.info("Switching %s to the %s device", num, "second" if use_second_url else "normal")
+    finally:
+        current_num_msg = current_num = None
+        _reset_number_clock()
 
 
 async def run_batch(message: Message, user_id: int, numbers: List[str],
@@ -5476,6 +5713,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
     if saved_file_run:
         path = SAVED_FILE_PATHS[file_name]          # SavedWS.txt is the WhatsApp path, SavedTG.txt the Telegram path
     active_path = path if path in PATH_IDENTIFIERS else "whatsapp"
+    second_device_run = saved_file_run or active_path == "telegram"    # the Telegram path only uses the second device for now
     active_otp_set_name = otp_set_name
     completed = start_index
     in_flight = False                  # a number has been started and is not finished yet
@@ -5493,11 +5731,18 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             await message.answer(text, parse_mode=parse_mode)
             return
 
-        if saved_file_run and not MACRODROID_WEBHOOK_URL_1:
-            # a Saved file only ever runs on the second device: without one the file is left exactly as it is
+        if second_device_run and not MACRODROID_WEBHOOK_URL_1:
+            # a Saved file / the Telegram path only ever runs on the second device: without one nothing is touched
+            what = file_name if saved_file_run else "The Telegram path"
             await message.answer(
-                f"❌ {file_name} always runs on the second device, but MACRODROID_WEBHOOK_URL_1 is not set. "
-                f"Set it, then resume {file_name} from /numberfiles. The file is untouched."
+                f"❌ {what} always runs on the second device, but MACRODROID_WEBHOOK_URL_1 is not set. "
+                "Set it and start again. Nothing was changed."
+            )
+            return
+        if active_path == "telegram" and not EMAILS:
+            await message.answer(
+                "❌ The Telegram path needs emails for the device, but EMAILS is empty. "
+                "Set it (comma separated) and start again. Nothing was changed."
             )
             return
 
@@ -5573,7 +5818,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             await status_msg.edit_text(f"Processing batch\n\nProgress: {idx + 1}/{total}\nTarget: {num}")
 
             outcome = await process_number(message, user_id, target_chat, num, otp_set_name,
-                                           start_on_second=saved_file_run, chat_mode=chat_mode)
+                                           start_on_second=second_device_run, chat_mode=chat_mode)
 
             if jump_requested_index is not None:
                 # /jumpto: this number is abandoned and the file carries on from the number that was asked for
@@ -6563,8 +6808,22 @@ async def handle_device_callback(request):
 
     # the code the device saved in its `wscode` variable:  /device_callback?wscode=123456
     # (or  /device_callback?status=wscode&code=123456 )
+    # waittime=2m30s / 3m / 45s: the ongoing number waits that long (all its timers included); it is not a status
+    wait_raw = request.query.get("waittime")
+    if wait_raw is not None:
+        seconds = _parse_wait_time(wait_raw)
+        if seconds is None:
+            logger.warning("Ignoring waittime %r: use Xm, Xs or XmXs", wait_raw)
+            return web.Response(text="waittime ignored (use Xm, Xs or XmXs)")
+        started = await _start_number_wait(seconds)
+        logger.info("Received waittime -> %s (%s)", _format_wait_time(seconds), "waiting" if started else "no number to wait")
+        return web.Response(text="waittime received" if started else "waittime ignored (no number is being processed)")
+
+    # (the Telegram path's device sends /device_callback?tgcode=123456 or status=tgcode&code=123456 the same way)
     code = request.query.get("wscode")
-    if code is None and status.lower() == "wscode":
+    if code is None:
+        code = request.query.get("tgcode")
+    if code is None and status.lower() in ("wscode", "tgcode"):
         code = request.query.get("code") or request.query.get("value") or ""
     if code is not None:
         accepted = receive_wscode(code)
