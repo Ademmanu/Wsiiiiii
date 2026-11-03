@@ -34,6 +34,8 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+# Telethon logs "Got difference for channel ... updates" at INFO for every channel update: only its warnings/errors are shown
+logging.getLogger("telethon").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 API_ID = int(os.getenv("API_ID", "0"))
@@ -3990,49 +3992,13 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
 # ------------------------------------------------------------
 @router.message(Command("start"))
 async def start_handler(message: Message):
-    help_text = (
+    await message.answer(
         "FORDET-Style Guardian Bot\n\n"
-        "Commands:\n"
-        "/login - connect your Telegram account (phone -> code -> 2FA)\n"
-        "/logout - disconnect and remove your saved session\n"
-        "/setchatid - Pair / Sell target chats: turn one on (never both) and set each one's ID (send None to empty it)\n"
-        "/otpgroups - manage OTP search sets (Name = pattern = group IDs)\n"
-        "/numberfiles - saved .txt number files (kept 48h, resume where you stopped)\n"
-        "/setaction - choose what the device's action status does: Switch or Save (or nothing)\n"
-        "/getallid - list the chat IDs of your logged-in account\n"
-        "/pause | /resume | /next | /jumpto | /stats | /stop\n"
-        "/pause holds the batch and /resume restarts the number you paused on. /jumpto asks which number of the file being "
-        "processed to jump to (1 to the file's total). /stop then Resume restarts the number it stopped on.\n\n"
-        "How it works:\n"
-        "1) /login and complete the interactive login flow\n"
-        "2) /otpgroups to add OTP sets, e.g. HK = 2|TGT|3 = -100123456789\n"
-        "3) Send numbers as text, or send a .txt file, then pick which OTP group to search (or All Groups), then choose the path: WhatsApp (MacroDroid identifier whatsapp_path) or Telegram (telegram_path). The Telegram path runs on the second device only: it sends the email the device asks for (EMAILS, in a circle), then a 5-digit code from the selected OTP group(s), then the number goes to the chat and the device is asked for its tgcode; blocked is Bad Num, registered is 🟤 Already Registered (unavailable, error and action are not used on this path for now). Any path: if the device sends waittime=Xm, Xs or XmXs, the ongoing number waits that long (⏰ Waiting), all its timers on hold. Files are saved while you are logged in, so you can resume them. A file remembers the OTP group and the path you picked (change them from the file's menu in /numberfiles)\n"
-        "4) If the device requests a code, the bot searches your OTP groups (short backfill + live handlers) "
-        f"for the number-derived pattern and sends the OTP it finds to the device. After {NO_CODE_AFTER_SECONDS}s without a code the "
-        "device gets no_code and the search keeps going. blocked / unavailable / try_again end the number at any point (unavailable is handled like Bad Num but shown as 🟤 Unavailable). If the device sends action (before it has continued), the option marked in /setaction decides: Switch restarts that number from type=check on the other device (MACRODROID_WEBHOOK_URL_1), with fresh timers, and all its calls go there (every new number starts on the normal device); Save keeps the number in SavedWS.txt (WhatsApp path) or SavedTG.txt (Telegram path), always processed on the second device with the file's own path (48h refreshed on every save), and moves to the next number; with none marked, action does nothing.\n"
-        f"5) All waiting on the device shares one {DEVICE_STATE_WAIT_SECONDS // 60}-minute budget counted from the check. "
-        f"If the device does not answer the check at all, it gets type=retry after {RETRY_AFTER_SECONDS}s and once more "
-        f"{RETRY_AFTER_SECONDS}s later; any response from the device stops the retrying for that number. "
-        "After the code is sent: continue starts the chat check, error searches for a new code, and success / failure "
-        "straight from the device ends the number at once (🟢 Success / 🟠 Failure). While the chat is awaited the device "
-        "can still report success / failure too, but only once the code step is done; whichever comes first wins.\n"
-        "6) On continue, your logged-in account sends the plain number (no forward tag) to the chat that is on in /setchatid. "
-        "Sell: the device is told type=wscode, and a code it sends back to /device_callback?wscode=... is sent as a reply "
-        "to the latest message the chat sent you. Pair: nothing goes to the device yet; the first tap-to-copy text the chat "
-        "shows after the number (like 4ET3-5UIS) is sent to the device as type=link&link_code=... (only the first). "
-        f"The bot waits up to {RESULT_WAIT_SECONDS // 60} minutes for a newer (or newly edited) message containing "
-        f"{', '.join(RESULT_KEYWORDS)} (any capitalisation; successful / successfully count as SUCCESS), or for success / failure "
-        "from the device, but only after the code step is done (Sell: the device's code received, Pair: the link code sent). "
-        "SUCCESS shows 🟢 Success, anything else 🟠 Failure. If no code comes the bot just waits.\n"
-        "7) When a number ends on a timeout, or a result is decided (from the chat or from the device), the device is told to clear before the "
-        f"next number starts, and the bot waits {CLEAR_EXTRA_DELAY_SECONDS:g}s more than usual before that next number. Bad Num / Try Later / error are not cleared, and no_code is not an ending.\n"
-        f"8) Only real phone numbers (with a country code, with or without +) are processed; anything else is ignored. "
-        f"If the device returns unavailable {UNAVAILABLE_PAUSE_AFTER} times in a row, the batch holds for {_human_secs(PAUSE_AUTO_RESUME_SECONDS)} "
-        "(or until /resume) and then carries on with the next number. Skipped and jumped-over numbers send clear too. "
-        "A saved file keeps every entry, junk included, and skips the junk when it is reached. Without a target chat ID "
-        "nothing is forwarded, but continue / success / failure from the device are still taken."
+        "Runs your phone numbers one by one through your MacroDroid devices (WhatsApp or Telegram path), "
+        "finds the OTP codes in the groups you choose, sends the numbers to your target chat and reports "
+        "the result of each one.\n\n"
+        "Use /login to get started."
     )
-    await message.answer(help_text)
 
 
 @router.message(Command("login"))
@@ -6832,6 +6798,11 @@ async def handle_device_callback(request):
         return web.Response(text="wscode received" if accepted else "wscode ignored (no number is waiting for a code)")
 
     logger.info("Received device callback -> %s", status)
+    lowered = status.strip().lower()
+    if _telegram_path() and ("unavailable" in lowered or ("error" in lowered and "request_code" not in lowered)):
+        # not used on the Telegram path for now: no state changes, no wake-up, not even a response for the retries
+        logger.info("Telegram path: ignoring %s", status)
+        return web.Response(text="Callback received (not used on the Telegram path, ignored)")
     if status.strip().lower() == "action" and _effective_action() is None:
         # nothing is marked in /setaction (or Switch cannot be done now): the action does nothing at all
         logger.info("Device sent action but no action applies: ignoring it")
