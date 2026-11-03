@@ -394,6 +394,7 @@ clock_offset = 0.0            # seconds of finished waits of the current number
 wait_started = 0.0            # real time the wait in progress began
 wait_end = 0.0                # real time it ends (0 = no wait in progress)
 wait_generation = 0
+prem_stop_flag = False        # the batch is being stopped because the device sent prem_stop
 current_num_msg = None        # the message of the number being processed (the wait is shown there)
 current_num: Optional[str] = None
 
@@ -464,6 +465,31 @@ async def _wait_over_notice(generation: int, msg, num: str) -> None:
             await msg.edit_text(f"{num} ⏳ Wait over. Continuing...")
         except Exception:
             pass
+
+
+async def _stop_for_premium() -> bool:
+    """
+    The device sent prem_stop: the file needs Telegram Premium for registration, so the whole batch stops (like /stop)
+    and run_batch tells the user why. False when no batch is running (or it is already stopping).
+    """
+    global stop_requested, prem_stop_flag
+    if not (is_processing and current_task) or stop_requested:
+        return False
+    prem_stop_flag = True
+    stop_requested = True               # every wait in the number flow checks this
+    pause_event.set()                   # wake a paused batch
+    device_event.set()                  # wake waits on the device
+    for waiter in list(live_success_failure_events.values()):
+        waiter.set()                    # wake a wait on the chat result
+    for st in list(live_wscode_state.values()):
+        st["wake"].set()
+    if current_num_msg is not None and current_num:
+        try:
+            await current_num_msg.edit_text(f"{current_num} ⛔ Needs Premium Telegram")
+        except Exception:
+            pass
+    current_task.cancel()
+    return True
 
 
 async def _start_number_wait(seconds: int) -> bool:
@@ -4837,7 +4863,7 @@ def _device_state_from_status(want_request: bool = False) -> Optional[str]:
             return "request_email"
         if "request_code" in status:
             return "request_code"
-    if "error" in status and "request_code" not in status and not _telegram_path():     # not on the Telegram path for now
+    if "error" in status and "request_code" not in status:
         return "error"
     if "continue" in status or "proceed" in status:
         return "continue"
@@ -5442,7 +5468,7 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
         await log_number_status(num, "try_again")
         return
 
-    if "error" in result_text and "request_code" not in result_text and not _telegram_path():
+    if "error" in result_text and "request_code" not in result_text:
         await num_msg.edit_text(f"{num} 🔴 Error Code")
         await log_number_status(num, "error")
         return
@@ -5671,9 +5697,10 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
     """
     global is_processing, is_paused, current_task, skip_current_number, current_index, \
         total_numbers_count, active_number, active_file_id, stop_requested, jump_requested_index, pause_interrupt, \
-        active_batch_user_id, active_path, active_otp_set_name, saved_interjection
+        active_batch_user_id, active_path, active_otp_set_name, saved_interjection, prem_stop_flag
 
     total = len(numbers)
+    prem_stop_flag = False
     active_batch_user_id = user_id
     saved_file_run = file_id is not None and _is_saved_file(file_name)    # Saved files always run on the second device
     if saved_file_run:
@@ -5852,10 +5879,22 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             logger.warning("Could not send the batch completed message")
 
     except (asyncio.CancelledError, BatchStopped):
-        logger.info("Batch stopped by user request.")
+        logger.info("Batch stopped by the device (prem_stop)." if prem_stop_flag else "Batch stopped by user request.")
         where = f"on number {completed + 1}/{total}" if in_flight else f"after number {completed}/{total}"
-        await _edit_status(status_msg, f"⏹️ Processing stopped {where}.")
-        if file_id is not None:
+        if prem_stop_flag:
+            reason = "the file needs Premium Telegram for registration"
+            await _edit_status(status_msg, f"⛔ Processing stopped {where}. Reason: {reason}.")
+            text = f"⛔ Processing stopped {where}.\nReason: {reason}."
+            if file_id is not None:
+                text += (f"\nResume restarts number {completed + 1} from its start (/numberfiles, {file_name})." if in_flight
+                         else f"\nResume continues with number {completed + 1} (/numberfiles, {file_name}).")
+            try:
+                await message.answer(text)
+            except Exception:
+                pass
+        else:
+            await _edit_status(status_msg, f"⏹️ Processing stopped {where}.")
+        if file_id is not None and not prem_stop_flag:
             try:
                 if in_flight:
                     await message.answer(f"⏹️ Stopped on number {completed + 1}/{total}. Resume restarts it from its start (/numberfiles, {file_name}).")
@@ -5878,6 +5917,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
         active_batch_user_id = None
         active_path = "whatsapp"
         active_otp_set_name = None
+        prem_stop_flag = False
         if saved_interjection is not None:
             logger.warning("A requested Saved file run was dropped: the batch ended before it could start")
             saved_interjection = None
@@ -6799,7 +6839,12 @@ async def handle_device_callback(request):
 
     logger.info("Received device callback -> %s", status)
     lowered = status.strip().lower()
-    if _telegram_path() and ("unavailable" in lowered or ("error" in lowered and "request_code" not in lowered)):
+    if "prem_stop" in lowered:
+        stopped = await _stop_for_premium()
+        logger.info("Received prem_stop (%s)", "stopping the batch" if stopped else "no batch to stop")
+        return web.Response(text="prem_stop received, stopping the batch" if stopped
+                            else "prem_stop ignored (no batch is running)")
+    if _telegram_path() and "unavailable" in lowered:
         # not used on the Telegram path for now: no state changes, no wake-up, not even a response for the retries
         logger.info("Telegram path: ignoring %s", status)
         return web.Response(text="Callback received (not used on the Telegram path, ignored)")
