@@ -388,7 +388,7 @@ def parse_phone_number(raw_number: str):
     return "", cleaned[1:]
 
 
-# ---- waittime: the device can ask the ongoing number to wait (waittime=2m30s / 3m / 45s). Everything the number does is
+# ---- waittime (Telegram path only): the device can ask the ongoing number to wait (waittime=2m30s / 3m / 45s). Everything the number does is
 # held and all its timers stand still, because they run on this clock, which does not count the waits.
 clock_offset = 0.0            # seconds of finished waits of the current number
 wait_started = 0.0            # real time the wait in progress began
@@ -483,12 +483,14 @@ async def _stop_for_premium() -> bool:
         waiter.set()                    # wake a wait on the chat result
     for st in list(live_wscode_state.values()):
         st["wake"].set()
-    if current_num_msg is not None and current_num:
+    msg, num = current_num_msg, current_num
+    # no cancel on purpose: every wait of the batch checks stop_requested and was just woken, so it stops by itself and
+    # then sends its "stopped" messages without being interrupted (a cancel could cut them off mid-send)
+    if msg is not None and num:
         try:
-            await current_num_msg.edit_text(f"{current_num} ⛔ Needs Premium Telegram")
+            await msg.edit_text(f"{num} ⛔ Needs Premium Telegram")
         except Exception:
             pass
-    current_task.cancel()
     return True
 
 
@@ -4863,7 +4865,7 @@ def _device_state_from_status(want_request: bool = False) -> Optional[str]:
             return "request_email"
         if "request_code" in status:
             return "request_code"
-    if "error" in status and "request_code" not in status:
+    if "error_code" in status:
         return "error"
     if "continue" in status or "proceed" in status:
         return "continue"
@@ -4927,7 +4929,7 @@ async def _search_for_otp(num_msg, user_id: int, num: str, otp_set_name: Optiona
 
             if not no_code_sent and _clock() >= no_code_at:
                 no_code_sent = True
-                await num_msg.edit_text(
+                await _safe_edit(num_msg, 
                     f"{num} ⚪ No code after {NO_CODE_AFTER_SECONDS}s. Still searching ({scope_label})..."
                 )
                 await call_device_api(num, payload_type="no_code")
@@ -4971,14 +4973,14 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
     """
     global device_status
     scope_label = _scope_label(otp_set_name)
-    await num_msg.edit_text(f"{num} ⚪ Device requested code. Searching OTP groups ({scope_label})...")
+    await _safe_edit(num_msg, f"{num} ⚪ Device requested code. Searching OTP groups ({scope_label})...")
 
     sent_codes: Set[str] = set()
     duration = min(OTP_SEARCH_DURATION, max(0.0, device_deadline - _clock()))
 
     async def finish(text: str, status: str, timed_out: bool = False, details: Optional[str] = None,
                      ret: Optional[str] = None) -> str:
-        await num_msg.edit_text(f"{num} {text}")
+        await _safe_edit(num_msg, f"{num} {text}")
         await log_number_status(num, status, details)
         if timed_out:
             return "timeout"
@@ -5035,7 +5037,7 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
 
         code, set_name = res["code"], res["set_name"]
         sent_codes.add(code)
-        await num_msg.edit_text(
+        await _safe_edit(num_msg, 
             f"{num} ⚪ OTP found (set {html.escape(set_name)}): <code>{code}</code>", parse_mode="HTML"
         )
 
@@ -5049,7 +5051,7 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
             return "continue"
         if state in ("success", "failure"):
             # the device reports the outcome before (or without) continue: an earlier, faster result
-            await num_msg.edit_text(f"{num} 🟢 Success" if state == "success" else f"{num} 🟠 Failure")
+            await _safe_edit(num_msg, f"{num} 🟢 Success" if state == "success" else f"{num} 🟠 Failure")
             await log_number_status(num, state, "from device")
             return "result"
         if state == "skip":
@@ -5075,7 +5077,7 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
         remaining = device_deadline - _clock()
         if remaining <= 0:
             return await finish(f"🟠 Ended (Device timeout after sending code - {DEVICE_STATE_WAIT_SECONDS // 60} mins)", "device_timeout_after_code", timed_out=True)
-        await num_msg.edit_text(f"{num} 🔁 Device reported an error. Rechecking OTP ({scope_label})...")
+        await _safe_edit(num_msg, f"{num} 🔁 Device reported an error. Rechecking OTP ({scope_label})...")
         duration = min(OTP_SEARCH_DURATION, remaining)
 
 
@@ -5090,7 +5092,7 @@ async def _email_stage(num_msg, user_id: int, num: str, device_deadline: float) 
     global device_status
 
     async def finish(text: str, status: str, timed_out: bool = False, ret: Optional[str] = None) -> str:
-        await num_msg.edit_text(f"{num} {text}")
+        await _safe_edit(num_msg, f"{num} {text}")
         await log_number_status(num, status)
         if timed_out:
             return "timeout"
@@ -5103,9 +5105,9 @@ async def _email_stage(num_msg, user_id: int, num: str, device_deadline: float) 
         _raise_if_stopped()
         device_event.clear()
         device_status = None
-        await num_msg.edit_text(f"{num} ⚪ Device requested an email. Sending {email}...")
+        await _safe_edit(num_msg, f"{num} ⚪ Device requested an email. Sending {email}...")
         if not await call_device_api(num, payload_type="email", email=email):
-            await num_msg.edit_text(f"{num} 🔴 Error (Webhook failed)")
+            await _safe_edit(num_msg, f"{num} 🔴 Error (Webhook failed)")
             await log_number_status(num, "webhook_error", "email")
             return "ended"
 
@@ -5117,7 +5119,7 @@ async def _email_stage(num_msg, user_id: int, num: str, device_deadline: float) 
         if state == "continue":
             return "continue"
         if state in ("success", "failure"):
-            await num_msg.edit_text(f"{num} 🟢 Success" if state == "success" else f"{num} 🟠 Failure")
+            await _safe_edit(num_msg, f"{num} 🟢 Success" if state == "success" else f"{num} 🟠 Failure")
             await log_number_status(num, state, "from device")
             return "result"
         if state == "skip":
@@ -5147,6 +5149,18 @@ def _human_secs(seconds: float) -> str:
     return f"{seconds / 60:g} minutes" if seconds >= 60 else f"{seconds:g} seconds"
 
 
+async def _safe_edit(msg, text: str, **kwargs) -> None:
+    """
+    Edits a message. Telegram answers "message is not modified" (an error) when the new text is the same as the
+    current one, which is harmless: it must never stop a number or a batch.
+    """
+    try:
+        await msg.edit_text(text, **kwargs)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc):
+            raise
+
+
 async def _edit_status(status_msg, text: str) -> None:
     """Edits the batch's first ("Processing...") message; a failed edit (unchanged, deleted) never stops the batch."""
     if status_msg is None:
@@ -5158,22 +5172,22 @@ async def _edit_status(status_msg, text: str) -> None:
 
 
 async def _device_pause_notice(num_msg, num: str) -> None:
-    await num_msg.edit_text(f"{num} ⏸️ Paused. This number restarts from its start when you /resume.")
+    await _safe_edit(num_msg, f"{num} ⏸️ Paused. This number restarts from its start when you /resume.")
     await log_number_status(num, "paused")
 
 
 async def _device_switch_notice(num_msg, num: str) -> None:
-    await num_msg.edit_text(f"{num} 🟣 Switched")
+    await _safe_edit(num_msg, f"{num} 🟣 Switched")
     await log_number_status(num, "switch")
 
 
 async def _device_save(num_msg, user_id: int, num: str) -> str:
     """The device sent action with Save marked: the number is kept in the Saved file of the batch's path and the batch moves on."""
     if await db_save_number(user_id, num, active_path):
-        await num_msg.edit_text(f"{num} 🟣 Saved")
+        await _safe_edit(num_msg, f"{num} 🟣 Saved")
         await log_number_status(num, "saved")
         return "saved"
-    await num_msg.edit_text(f"{num} ⚠️ Could not save to {SAVED_FILES[active_path]} (database unavailable)")
+    await _safe_edit(num_msg, f"{num} ⚠️ Could not save to {SAVED_FILES[active_path]} (database unavailable)")
     await log_number_status(num, "save_failed")
     return "ended"
 
@@ -5381,7 +5395,7 @@ async def _wait_first_device_answer(num_msg, num: str, check_sent_at: float, dea
             continue        # the device did respond (just not with something the bot acts on): no more retries
         if retry_at is not None and _clock() >= retry_at - 0.001 and deadline - _clock() > 0:
             retries += 1
-            await num_msg.edit_text(f"{num} ⏳ No response from the device. Retry {retries}/{RETRY_MAX} sent...")
+            await _safe_edit(num_msg, f"{num} ⏳ No response from the device. Retry {retries}/{RETRY_MAX} sent...")
             if not await call_device_api(num, payload_type="retry"):
                 logger.warning(f"Could not send retry {retries} for {num}")
             window_start = _clock()      # the next RETRY_AFTER_SECONDS of silence are counted from this retry
@@ -5414,7 +5428,7 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
 
     success = await call_device_api(num, payload_type="check")
     if not success:
-        await num_msg.edit_text(f"{num} 🔴 Error (Webhook failed)")
+        await _safe_edit(num_msg, f"{num} 🔴 Error (Webhook failed)")
         await log_number_status(num, "webhook_error")
         return
 
@@ -5422,15 +5436,15 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
     _raise_if_stopped()
     if not got_answer:
         if skip_current_number:
-            await num_msg.edit_text(f"{num} ⏭️ Skipped")
+            await _safe_edit(num_msg, f"{num} ⏭️ Skipped")
             await log_number_status(num, "skipped")
             return "skipped"
-        await num_msg.edit_text(f"{num} 🟠 Ended (Device timeout - {DEVICE_STATE_WAIT_SECONDS // 60} mins)")
+        await _safe_edit(num_msg, f"{num} 🟠 Ended (Device timeout - {DEVICE_STATE_WAIT_SECONDS // 60} mins)")
         await log_number_status(num, "device_timeout")
         return "timeout"
 
     if skip_current_number:
-        await num_msg.edit_text(f"{num} ⏭️ Skipped")
+        await _safe_edit(num_msg, f"{num} ⏭️ Skipped")
         await log_number_status(num, "skipped")
         return "skipped"
 
@@ -5448,28 +5462,28 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
         return await _device_save(num_msg, user_id, num)
 
     if "blocked" in result_text:
-        await num_msg.edit_text(f"{num} ⚫ Bad Num")
+        await _safe_edit(num_msg, f"{num} ⚫ Bad Num")
         await log_number_status(num, "blocked")
         return
 
     if _telegram_path() and "registered" in result_text:
-        await num_msg.edit_text(f"{num} 🟤 Already Registered")
+        await _safe_edit(num_msg, f"{num} 🟤 Already Registered")
         await log_number_status(num, "registered")
         return
 
     if "unavailable" in result_text and not _telegram_path():
         # handled like Bad Num but shown and logged as Unavailable; the batch counts how many came in a row
-        await num_msg.edit_text(f"{num} 🟤 Unavailable")
+        await _safe_edit(num_msg, f"{num} 🟤 Unavailable")
         await log_number_status(num, "unavailable")
         return "unavailable"
 
     if "try_again" in result_text:
-        await num_msg.edit_text(f"{num} 🟡 Try Later")
+        await _safe_edit(num_msg, f"{num} 🟡 Try Later")
         await log_number_status(num, "try_again")
         return
 
-    if "error" in result_text and "request_code" not in result_text:
-        await num_msg.edit_text(f"{num} 🔴 Error Code")
+    if "error_code" in result_text:
+        await _safe_edit(num_msg, f"{num} 🔴 Error Code")
         await log_number_status(num, "error")
         return
 
@@ -5487,7 +5501,7 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
     else:
         result_after = (device_status or "").lower()
         if "continue" not in result_after and "continued" not in result_after and "proceed" not in result_after:
-            await num_msg.edit_text(f"{num} ⚠️ Device did not signal to continue. Status: `{device_status}`", parse_mode="Markdown")
+            await _safe_edit(num_msg, f"{num} ⚠️ Device did not signal to continue. Status: `{device_status}`", parse_mode="Markdown")
             await log_number_status(num, "no_continue")
             return
 
@@ -5497,15 +5511,15 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
 
     _raise_if_stopped()
     if skip_current_number:
-        await num_msg.edit_text(f"{num} ⏭️ Skipped")
+        await _safe_edit(num_msg, f"{num} ⏭️ Skipped")
         await log_number_status(num, "skipped")
         return "skipped"
     if target_chat and chat_mode == "pair":
-        await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and waiting for the link code from the chat...")
+        await _safe_edit(num_msg, f"{num} 🟢 Continued. Forwarding internally and waiting for the link code from the chat...")
     elif target_chat:
-        await num_msg.edit_text(f"{num} 🟢 Continued. Forwarding internally and awaiting {'/'.join(RESULT_KEYWORDS)}...")
+        await _safe_edit(num_msg, f"{num} 🟢 Continued. Forwarding internally and awaiting {'/'.join(RESULT_KEYWORDS)}...")
     else:
-        await num_msg.edit_text(
+        await _safe_edit(num_msg, 
             f"{num} 🟢 Continued. No forward was done: no target chat ID was set (use /setchatid). "
             "Waiting for success/failure from the device..."
         )
@@ -5513,7 +5527,7 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
     # with a target chat, success / failure only count after the code step (Sell: the device's code, Pair: the link code)
     early = _device_outcome_from_status() if not target_chat else None
     if early:
-        await num_msg.edit_text(f"{num} 🟢 Success" if early == "success" else f"{num} 🟠 Failure")
+        await _safe_edit(num_msg, f"{num} 🟢 Success" if early == "success" else f"{num} 🟠 Failure")
         await log_number_status(num, early, "from device")
         return "result"
 
@@ -5544,7 +5558,7 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
             ok, reason = await forward_message_direct(user_id, target_chat, num, sent_info)
             if not ok:
                 logger.error("Failed to forward to target chat %s (%s)", target_chat, reason)
-                await num_msg.edit_text(f"{num} ❌ Error forwarding to target chat ID.")
+                await _safe_edit(num_msg, f"{num} ❌ Error forwarding to target chat ID.")
                 return None
 
             sent_id = sent_info.get("message_id")
@@ -5580,12 +5594,12 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
                 link_sent = True
                 link_code = link_st["code"]
                 if not await call_device_api(num, payload_type="link", link_code=link_code):
-                    await num_msg.edit_text(f"{num} 🔴 Error (Webhook failed)")
+                    await _safe_edit(num_msg, f"{num} 🔴 Error (Webhook failed)")
                     await log_number_status(num, "webhook_error", "link")
                     return None
                 gate["gate_open"] = True          # success / failed count from now on
                 _forget_device_status()           # what the device said before the link was sent does not count
-                await num_msg.edit_text(
+                await _safe_edit(num_msg, 
                     f"{num} 🟢 Link code {link_code} sent to the device. Awaiting {'/'.join(RESULT_KEYWORDS)}..."
                 )
             if ev.is_set():
@@ -5617,35 +5631,35 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
         _raise_if_stopped()
 
         if device_outcome and not got_result:
-            await num_msg.edit_text(f"{num} 🟢 Success" if device_outcome == "success" else f"{num} 🟠 Failure")
+            await _safe_edit(num_msg, f"{num} 🟢 Success" if device_outcome == "success" else f"{num} 🟠 Failure")
             await log_number_status(num, device_outcome, "from device")
             return "result"
 
         if skipped:
-            await num_msg.edit_text(f"{num} ⏭️ Skipped")
+            await _safe_edit(num_msg, f"{num} ⏭️ Skipped")
             await log_number_status(num, "skipped")
             return "skipped"
 
         if got_result:
             decision = live_success_failure_results.get(key, "UNKNOWN")
             if decision == "SUCCESS":
-                await num_msg.edit_text(f"{num} 🟢 Success")
+                await _safe_edit(num_msg, f"{num} 🟢 Success")
             else:
-                await num_msg.edit_text(f"{num} 🟠 Failure")
+                await _safe_edit(num_msg, f"{num} 🟠 Failure")
             await log_number_status(num, decision.lower())
             return "result"
 
         if target_chat and pair and not link_sent:
-            await num_msg.edit_text(
+            await _safe_edit(num_msg, 
                 f"{num} 🟠 Live decision timeout (No link code seen in the chat){_chat_seen_summary(user_id, sent_id)}"
             )
         elif target_chat:
-            await num_msg.edit_text(
+            await _safe_edit(num_msg, 
                 f"{num} 🟠 Live decision timeout (No {'/'.join(RESULT_KEYWORDS)} received)"
                 f"{_chat_seen_summary(user_id, sent_id)}{'' if pair else _wscode_summary(key)}"
             )
         else:
-            await num_msg.edit_text(
+            await _safe_edit(num_msg, 
                 f"{num} 🟠 Timeout: no success/failure came from the device, and no target chat ID was set "
                 "so nothing was forwarded (use /setchatid)."
             )
@@ -5778,6 +5792,10 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             in_flight = True
 
             if saved_interjection is not None:
+                await _edit_status(
+                    status_msg,
+                    f"⏸️ Processing paused\n\nRunning {saved_interjection['file_name']} first, then the batch continues.",
+                )
                 await _run_saved_interjection()      # a Saved file was resumed meanwhile (Save marked): its numbers go first
             if is_paused:
                 await _edit_status(
@@ -5808,7 +5826,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
                 if file_id is not None:
                     await db_set_file_progress(file_id, completed)
                 continue
-            await status_msg.edit_text(f"Processing batch\n\nProgress: {idx + 1}/{total}\nTarget: {num}")
+            await _edit_status(status_msg, f"Processing batch\n\nProgress: {idx + 1}/{total}\nTarget: {num}")
 
             outcome = await process_number(message, user_id, target_chat, num, otp_set_name,
                                            start_on_second=second_device_run, chat_mode=chat_mode)
@@ -5883,15 +5901,15 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
         where = f"on number {completed + 1}/{total}" if in_flight else f"after number {completed}/{total}"
         if prem_stop_flag:
             reason = "the file needs Premium Telegram for registration"
-            await _edit_status(status_msg, f"⛔ Processing stopped {where}. Reason: {reason}.")
             text = f"⛔ Processing stopped {where}.\nReason: {reason}."
             if file_id is not None:
                 text += (f"\nResume restarts number {completed + 1} from its start (/numberfiles, {file_name})." if in_flight
                          else f"\nResume continues with number {completed + 1} (/numberfiles, {file_name}).")
             try:
-                await message.answer(text)
-            except Exception:
-                pass
+                await message.answer(text)                 # the new message goes first
+            except Exception as exc:
+                logger.warning(f"Could not send the prem_stop message: {exc}")
+            await _edit_status(status_msg, f"⛔ Processing stopped {where}. Reason: {reason}.")
         else:
             await _edit_status(status_msg, f"⏹️ Processing stopped {where}.")
         if file_id is not None and not prem_stop_flag:
@@ -6808,9 +6826,30 @@ async def handle_health_check(request):
     return web.Response(text="Bot is running live!")
 
 
+# Statuses (and callback values) that only exist on one path. On the other path they are ignored entirely: no state
+# change, no wake-up, not even a response for the retries.
+_TELEGRAM_ONLY_STATUSES = ("request_email", "registered", "tgcode", "prem_stop", "waittime")
+_WHATSAPP_ONLY_STATUSES = ("unavailable", "action", "wscode")
+
+
+def _foreign_callback(lowered_status: str, query) -> Optional[str]:
+    """The name of a status / value of the other path in this callback (None = nothing foreign)."""
+    for name in (_WHATSAPP_ONLY_STATUSES if _telegram_path() else _TELEGRAM_ONLY_STATUSES):
+        if name in lowered_status or name in query:
+            return name
+    return None
+
+
 async def handle_device_callback(request):
     global device_status, device_event
     status = request.query.get("status", "unknown")
+    lowered = status.strip().lower()
+
+    # a status (or code value) that only exists on the other path is ignored entirely, before anything else looks at it
+    foreign = _foreign_callback(lowered, request.query)
+    if foreign:
+        logger.info("Ignoring %s: it is not used on the %s path", foreign, PATH_LABELS[active_path])
+        return web.Response(text=f"Callback received ({foreign} is not used on the {PATH_LABELS[active_path]} path, ignored)")
 
     # the code the device saved in its `wscode` variable:  /device_callback?wscode=123456
     # (or  /device_callback?status=wscode&code=123456 )
@@ -6838,16 +6877,11 @@ async def handle_device_callback(request):
         return web.Response(text="wscode received" if accepted else "wscode ignored (no number is waiting for a code)")
 
     logger.info("Received device callback -> %s", status)
-    lowered = status.strip().lower()
     if "prem_stop" in lowered:
         stopped = await _stop_for_premium()
         logger.info("Received prem_stop (%s)", "stopping the batch" if stopped else "no batch to stop")
         return web.Response(text="prem_stop received, stopping the batch" if stopped
                             else "prem_stop ignored (no batch is running)")
-    if _telegram_path() and "unavailable" in lowered:
-        # not used on the Telegram path for now: no state changes, no wake-up, not even a response for the retries
-        logger.info("Telegram path: ignoring %s", status)
-        return web.Response(text="Callback received (not used on the Telegram path, ignored)")
     if status.strip().lower() == "action" and _effective_action() is None:
         # nothing is marked in /setaction (or Switch cannot be done now): the action does nothing at all
         logger.info("Device sent action but no action applies: ignoring it")
