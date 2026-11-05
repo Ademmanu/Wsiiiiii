@@ -72,6 +72,7 @@ OTP_SEARCH_DURATION = int(os.getenv("OTP_SEARCH_DURATION", "300"))
 
 # number files (/numberfiles)
 NUMBER_FILE_TTL_HOURS = int(os.getenv("NUMBER_FILE_TTL_HOURS", "48"))
+ACTION_CHECK_WAIT_SECONDS = float(os.getenv("ACTION_CHECK_WAIT_SECONDS", "30"))  # how long the Sell chat check before Save / Switch waits
 SAVED_INTERJECT_COUNT = 2              # numbers of a Saved file run when it is resumed while another batch is processing
 # the number files the Save action keeps numbers in, one per path (always run on the second device, on their own path)
 SAVED_FILES = {"whatsapp": "SavedWS.txt", "telegram": "SavedTG.txt"}
@@ -114,7 +115,8 @@ db_pool: Optional[asyncpg.Pool] = None
 # /setchatid: two target chats per user. At most one is on; the one that is on receives the numbers.
 #   Sell: the device's code is replied in the chat (type=wscode)      Pair: the chat's code goes to the device (type=link)
 CHAT_MODES = {"pair": "Pair", "sell": "Sell"}
-user_chat_cfg: Dict[int, Dict[str, Any]] = {}   # user -> {"pair_id": int|None, "sell_id": int|None, "active": "pair"|"sell"|None}
+# every path has its own Pair / Sell chats:  user -> path -> {"pair_id": int|None, "sell_id": int|None, "active": "pair"|"sell"|None}
+user_chat_cfg: Dict[int, Dict[str, Dict[str, Any]]] = {}
 
 is_processing = False
 is_paused = False
@@ -154,6 +156,7 @@ live_success_failure_results: dict[tuple, str] = {}
 recent_chat_messages: Dict[int, OrderedDict] = {}  # last messages seen in the target chat, only to explain a timeout
 live_wscode_state: dict[tuple, dict] = {}  # per number waiting for a chat result: codes from the device + what to reply to
 live_success_failure_state: dict[tuple, dict] = {}  # per waiter: id of the message we sent + results seen before we knew it + gate_open
+live_action_check_state: dict[tuple, dict] = {}  # WhatsApp: the Sell chat check before Save / Switch (first word it shows)
 live_link_state: dict[tuple, dict] = {}  # Pair: per number, the first tap-to-copy code seen in the chat after the number was sent
 
 # fordet client / live-handler state
@@ -231,6 +234,20 @@ _SCHEMA_STATEMENTS = [
             sell_id BIGINT,
             active TEXT
         )"""),
+    # the chats of each path (WhatsApp / Telegram); the old per-user rows of chat_modes become the WhatsApp ones
+    ("chat_modes_by_path", """
+        CREATE TABLE IF NOT EXISTS chat_modes_by_path (
+            user_id BIGINT NOT NULL,
+            path TEXT NOT NULL,
+            pair_id BIGINT,
+            sell_id BIGINT,
+            active TEXT,
+            PRIMARY KEY (user_id, path)
+        )"""),
+    ("chat_modes -> chat_modes_by_path", """
+        INSERT INTO chat_modes_by_path (user_id, path, pair_id, sell_id, active)
+        SELECT user_id, 'whatsapp', pair_id, sell_id, active FROM chat_modes
+        ON CONFLICT (user_id, path) DO NOTHING"""),
     ("user_device_action", """
         CREATE TABLE IF NOT EXISTS user_device_action (
             user_id BIGINT PRIMARY KEY,
@@ -299,52 +316,58 @@ async def db_set_device_action(user_id: int, action: Optional[str]) -> None:
         logger.warning(f"Could not save the device action for user {user_id}: {e}")
 
 
-async def _get_chat_cfg(user_id: int) -> Dict[str, Any]:
+async def _get_chat_cfg(user_id: int, path: str) -> Dict[str, Any]:
     """
-    The user's Pair / Sell chat settings (loaded once, then kept in memory). A user who only had the old single
-    target chat gets it as the Sell ID with Sell on, so nothing changes for them until they open /setchatid.
+    The Pair / Sell chat settings of one path of the user (loaded once, then kept in memory). A user who only had the
+    old single target chat gets it as the WhatsApp Sell ID with Sell on, so nothing changes for them; the Telegram
+    path starts with both chats empty.
     """
-    cfg = user_chat_cfg.get(user_id)
-    if cfg is not None:
-        return cfg
-    cfg = {"pair_id": None, "sell_id": None, "active": None}
-    if db_pool:
-        try:
-            async with db_pool.acquire() as conn:
-                row = await conn.fetchrow("SELECT pair_id, sell_id, active FROM chat_modes WHERE user_id = $1", user_id)
-                if row is not None:
-                    cfg = {
-                        "pair_id": int(row["pair_id"]) if row["pair_id"] is not None else None,
-                        "sell_id": int(row["sell_id"]) if row["sell_id"] is not None else None,
-                        "active": row["active"] if row["active"] in CHAT_MODES else None,
-                    }
-                else:
-                    legacy = await conn.fetchrow("SELECT chat_id FROM bot_settings WHERE user_id = $1", user_id)
-                    if legacy is not None and legacy["chat_id"] is not None:
-                        cfg = {"pair_id": None, "sell_id": int(legacy["chat_id"]), "active": "sell"}
-        except Exception:
-            logger.exception(f"Could not load the chat settings of user {user_id}")
-    if cfg["active"] and not cfg[f"{cfg['active']}_id"]:
-        cfg["active"] = None                      # never on without an ID
-    user_chat_cfg[user_id] = cfg
-    return cfg
+    path = path if path in PATH_IDENTIFIERS else "whatsapp"
+    per_path = user_chat_cfg.get(user_id)
+    if per_path is None:
+        per_path = {p: {"pair_id": None, "sell_id": None, "active": None} for p in PATH_IDENTIFIERS}
+        if db_pool:
+            try:
+                async with db_pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT path, pair_id, sell_id, active FROM chat_modes_by_path WHERE user_id = $1", user_id)
+                    for row in rows:
+                        if row["path"] in per_path:
+                            per_path[row["path"]] = {
+                                "pair_id": int(row["pair_id"]) if row["pair_id"] is not None else None,
+                                "sell_id": int(row["sell_id"]) if row["sell_id"] is not None else None,
+                                "active": row["active"] if row["active"] in CHAT_MODES else None,
+                            }
+                    if not any(row["path"] == "whatsapp" for row in rows):
+                        legacy = await conn.fetchrow("SELECT chat_id FROM bot_settings WHERE user_id = $1", user_id)
+                        if legacy is not None and legacy["chat_id"] is not None:
+                            per_path["whatsapp"] = {"pair_id": None, "sell_id": int(legacy["chat_id"]), "active": "sell"}
+            except Exception:
+                logger.exception(f"Could not load the chat settings of user {user_id}")
+        for cfg in per_path.values():
+            if cfg["active"] and not cfg[f"{cfg['active']}_id"]:
+                cfg["active"] = None                  # never on without an ID
+        user_chat_cfg[user_id] = per_path
+    return per_path[path]
 
 
-async def _save_chat_cfg(user_id: int, cfg: Dict[str, Any]) -> bool:
-    """Stores the Pair / Sell settings in memory (already done by the caller) and in the database."""
-    user_chat_cfg[user_id] = cfg
+async def _save_chat_cfg(user_id: int, path: str, cfg: Dict[str, Any]) -> bool:
+    """Keeps one path's Pair / Sell settings in memory (the caller already changed `cfg`) and in the database."""
+    path = path if path in PATH_IDENTIFIERS else "whatsapp"
+    await _get_chat_cfg(user_id, path)               # makes sure the user's settings are loaded
+    user_chat_cfg[user_id][path] = cfg
     if not db_pool:
         return False
     try:
         async with db_pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO chat_modes (user_id, pair_id, sell_id, active)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (user_id)
+                INSERT INTO chat_modes_by_path (user_id, path, pair_id, sell_id, active)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (user_id, path)
                 DO UPDATE SET pair_id = EXCLUDED.pair_id, sell_id = EXCLUDED.sell_id, active = EXCLUDED.active
                 """,
-                user_id, cfg["pair_id"], cfg["sell_id"], cfg["active"],
+                user_id, path, cfg["pair_id"], cfg["sell_id"], cfg["active"],
             )
         return True
     except Exception:
@@ -2196,6 +2219,109 @@ def _wscode_summary(key: tuple) -> str:
     return f"\n{label}: {st['replied']} sent, {pending} not sent (the chat sent no message to reply to)."
 
 
+_ACTION_REGISTERED_RE = re.compile(r"\bregistered\b", re.IGNORECASE)
+_ACTION_SUBMITTED_RE = re.compile(r"\bsubmitted\b", re.IGNORECASE)
+
+
+def check_action_message(user_id: int, message, text: str) -> None:
+    """
+    WhatsApp path: a message of the Sell chat (new or edited) that came after the number sent for the check before a
+    Save / Switch says registered or submitted. "registered" wins if a message says both. The first verdict stays.
+    """
+    if not live_action_check_state or getattr(message, "out", False) or not text:
+        return
+    if _ACTION_REGISTERED_RE.search(text):
+        verdict = "registered"
+    elif _ACTION_SUBMITTED_RE.search(text):
+        verdict = "submitted"
+    else:
+        return
+    msg_id = getattr(message, "id", None)
+    edit_date = getattr(message, "edit_date", None)
+    for key, st in list(live_action_check_state.items()):
+        if key[0] != user_id or st["verdict"] is not None:
+            continue
+        if st["sent_id"] is None:
+            st["buffer"].append((msg_id, edit_date, verdict))          # our send hasn't returned yet: judge it later
+            continue
+        if not _is_after_send(st["sent_id"], st.get("sent_date"), msg_id, edit_date):
+            continue
+        st["verdict"] = verdict
+        st["wake"].set()
+        logger.info(f"[action check] {key[1]}: the Sell chat says {verdict}")
+
+
+def arm_action_check(key: tuple, sent_id: Optional[int], sent_date=None) -> None:
+    st = live_action_check_state.get(key)
+    if st is None:
+        return
+    st["sent_id"] = sent_id if sent_id is not None else 0
+    st["sent_date"] = sent_date
+    for msg_id, edit_date, verdict in st["buffer"]:
+        if st["verdict"] is None and _is_after_send(st["sent_id"], sent_date, msg_id, edit_date):
+            st["verdict"] = verdict
+    st["buffer"].clear()
+    if st["verdict"] is not None:
+        st["wake"].set()
+
+
+async def _action_precheck(num_msg, user_id: int, num: str) -> Optional[str]:
+    """
+    WhatsApp path, before a Save / Switch action runs: when Sell is the chat that is on, the number is sent to the Sell
+    chat and the messages that follow are read. Returns "registered" when one says registered (the action must not
+    run), None to go ahead: it said submitted, Pair is on, Sell is off / has no ID, or nothing conclusive came in
+    ACTION_CHECK_WAIT_SECONDS.
+    """
+    if _telegram_path():
+        return None
+    mode, chat_id = await _get_active_chat(user_id, active_path)
+    if mode != "sell" or not chat_id:                    # Pair on, or Sell off: no check
+        return None
+    key = (user_id, num)
+    st = {"sent_id": None, "sent_date": None, "buffer": [], "verdict": None, "wake": asyncio.Event()}
+    live_action_check_state[key] = st
+    try:
+        await _safe_edit(num_msg, f"{num} 🔎 Checking in the Sell chat before the action...")
+        sent_info: dict = {}
+        _raise_if_stopped()
+        ok, reason = await forward_message_direct(user_id, chat_id, num, sent_info)
+        if not ok:
+            logger.warning(f"Action check: could not send {num} to the Sell chat ({reason}); going ahead")
+            return None
+        arm_action_check(key, sent_info.get("message_id"), sent_info.get("sent_date"))
+        deadline = time.time() + ACTION_CHECK_WAIT_SECONDS
+        while st["verdict"] is None:
+            _raise_if_stopped()
+            remaining = deadline - time.time()
+            if remaining <= 0 or skip_current_number or pause_interrupt:
+                break
+            st["wake"].clear()
+            await _wait_any([st["wake"], device_event], remaining)
+            if device_event.is_set():
+                device_event.clear()                      # a device status during the check is not looked at
+        if st["verdict"] is None:
+            logger.info(f"Action check: nothing conclusive for {num} in {ACTION_CHECK_WAIT_SECONDS:g}s; going ahead")
+        return "registered" if st["verdict"] == "registered" else None
+    finally:
+        live_action_check_state.pop(key, None)
+
+
+async def _perform_action(num_msg, user_id: int, num: str, action: str) -> str:
+    """
+    The device sent action and Save / Switch is marked. On the WhatsApp path with Sell on, the Sell chat is checked
+    first: registered ends the number as Already Registered without saving or switching; submitted goes ahead.
+    Returns "saved", "switch" or "ended".
+    """
+    if await _action_precheck(num_msg, user_id, num) == "registered":
+        await _safe_edit(num_msg, f"{num} 🟤 Already Registered")
+        await log_number_status(num, "registered", "Sell chat, before the action")
+        return "ended"
+    if action == "save":
+        return await _device_save(num_msg, user_id, num)
+    await _device_switch_notice(num_msg, num)
+    return "switch"
+
+
 def _forget_device_status() -> None:
     """Drops the last device status (and its wake-up) so only statuses sent from now on are looked at."""
     global device_status
@@ -2276,10 +2402,11 @@ async def _wait_any(events_: List[asyncio.Event], timeout: float) -> None:
             w.cancel()
 
 
-async def update_result_handler_for_user(user_id: int):
+async def update_result_handler_for_user(user_id: int, path: Optional[str] = None):
     """
     Register the permanent NewMessage handler on the user's target chat that
     decides SUCCESS / FAILED for the number currently being processed.
+    The chat is the one that is on for `path` (default: the path of the user's running batch, else WhatsApp).
     Called at login, session restore, reconnect and whenever /setchatid changes.
     """
     client = user_clients.get(user_id)
@@ -2288,7 +2415,9 @@ async def update_result_handler_for_user(user_id: int):
 
     _clear_result_handlers(user_id, client)
 
-    chat_id = await _get_user_target_chat(user_id)
+    if path is None:
+        path = active_path if (is_processing and active_batch_user_id == user_id) else "whatsapp"
+    chat_id = await _get_user_target_chat(user_id, path)
     if not chat_id:
         return
 
@@ -2303,6 +2432,7 @@ async def update_result_handler_for_user(user_id: int):
             check_result_message(user_id, text, getattr(message, "id", None), getattr(message, "reply_to_msg_id", None),
                                  getattr(message, "edit_date", None))
             check_link_code(user_id, message)              # Pair: the first tap-to-copy code after our number
+            check_action_message(user_id, message, text)   # WhatsApp: registered / submitted before a Save / Switch
             is_edit = getattr(message, "edit_date", None) is not None or "Edited" in type(event).__qualname__
             if not is_edit and not getattr(message, "out", False):
                 note_incoming_message(user_id, getattr(message, "id", None))
@@ -3877,18 +4007,18 @@ async def _load_saved_sessions_on_startup():
         await restore_single_session(row["user_id"], row["session_data"])
 
 
-async def _get_active_chat(user_id: int) -> Tuple[Optional[str], Optional[int]]:
-    """(mode, chat id) of the chat that is on: ("pair" | "sell", id), or (None, None) when both are off."""
-    cfg = await _get_chat_cfg(user_id)
+async def _get_active_chat(user_id: int, path: str) -> Tuple[Optional[str], Optional[int]]:
+    """(mode, chat id) of the chat that is on for a path: ("pair" | "sell", id), or (None, None) when both are off."""
+    cfg = await _get_chat_cfg(user_id, path)
     mode = cfg["active"]
     if mode and cfg[f"{mode}_id"]:
         return mode, cfg[f"{mode}_id"]
     return None, None
 
 
-async def _get_user_target_chat(user_id: int) -> Optional[int]:
-    """The chat id that receives the numbers (None = both off / no ID: nothing is forwarded)."""
-    return (await _get_active_chat(user_id))[1]
+async def _get_user_target_chat(user_id: int, path: str) -> Optional[int]:
+    """The chat id that receives the numbers of a path (None = both off / no ID: nothing is forwarded)."""
+    return (await _get_active_chat(user_id, path))[1]
 
 
 # ------------------------------------------------------------
@@ -4053,12 +4183,17 @@ async def otpgroups_cmd_handler(message: Message):
     await otpgroups_command(update, context)
 
 
-async def _set_chat_id(message: Message, user_id: int, mode: str, chat_id: Optional[int]) -> None:
-    """Sets (or empties) the ID of the Pair or Sell chat. An empty ID can't be on, so it turns that chat off."""
-    cfg = await _get_chat_cfg(user_id)
+def _batch_running_on(user_id: int, path: str) -> bool:
+    return bool(is_processing and active_batch_user_id == user_id and active_path == path)
+
+
+async def _set_chat_id(message: Message, user_id: int, path: str, mode: str, chat_id: Optional[int]) -> None:
+    """Sets (or empties) the ID of the Pair or Sell chat of a path. An empty ID can't be on, so it turns that chat off."""
+    cfg = await _get_chat_cfg(user_id, path)
     label = CHAT_MODES[mode]
-    if is_processing and cfg["active"] == mode:
-        await message.answer(f"⚠️ A batch is running on the {label} chat. Use /stop first, then change its ID.")
+    if _batch_running_on(user_id, path) and cfg["active"] == mode:
+        await message.answer(f"⚠️ A batch is running on the {label} chat of the {PATH_LABELS[path]} path. "
+                             "Use /stop first, then change its ID.")
         return
     cfg[f"{mode}_id"] = chat_id
     if chat_id is None:
@@ -4069,11 +4204,11 @@ async def _set_chat_id(message: Message, user_id: int, mode: str, chat_id: Optio
             notice = f"✅ {label} chat ID is now empty."
     else:
         notice = f"✅ {label} chat ID set to <code>{chat_id}</code>."
-    if not await _save_chat_cfg(user_id, cfg):
+    if not await _save_chat_cfg(user_id, path, cfg):
         notice += "\n⚠️ It could not be saved to the database, so it will be lost on restart."
     # the SUCCESS/FAILED live handler follows the chat that is on
     await update_result_handler_for_user(user_id)
-    text, markup = _setchatid_mode_view(cfg, mode, notice)
+    text, markup = _setchatid_mode_view(cfg, path, mode, notice)
     await message.answer(text, parse_mode="HTML", reply_markup=markup)
 
 
@@ -4087,12 +4222,12 @@ def _setchatid_markup() -> InlineKeyboardMarkup:
     return _prompt_cancel_markup([InlineKeyboardButton("🆔 Get chat IDs", callback_data="pr_ids")])
 
 
-async def _try_setchatid(message: Message, raw: str, mode: str, retry: bool = False) -> str:
+async def _try_setchatid(message: Message, raw: str, path: str, mode: str, retry: bool = False) -> str:
     """Applies the answer to a Set ID / Change ID prompt ('None' = empty). Returns 'ok' or 'invalid'."""
     value = (raw or "").strip()
     user_id = message.from_user.id
     if value.lower() == "none":
-        await _set_chat_id(message, user_id, mode, None)
+        await _set_chat_id(message, user_id, path, mode, None)
         return "ok"
     try:
         chat_id = int(value)
@@ -4103,11 +4238,15 @@ async def _try_setchatid(message: Message, raw: str, mode: str, retry: bool = Fa
             reply_markup=_setchatid_markup() if retry else None,
         )
         return "invalid"
-    await _set_chat_id(message, user_id, mode, chat_id)
+    await _set_chat_id(message, user_id, path, mode, chat_id)
     return "ok"
 
 
-def _mode_how(mode: str) -> str:
+def _mode_how(mode: str, path: str = "whatsapp") -> str:
+    if path == "telegram":
+        return ("The number goes to this chat and the device is asked for its code (type=tgcode); the device's code is "
+                "replied in the chat. Success / failed count after the device's tgcode arrives. "
+                "Pair and Sell work the same way on the Telegram path for now.")
     if mode == "pair":
         return ("The number goes to this chat. The first tap-to-copy code the chat shows after it is sent to the "
                 "device (type=link with link_code). Success / failed count after that.")
@@ -4121,39 +4260,61 @@ def _chat_status_line(cfg: Dict[str, Any], mode: str) -> str:
     return f"• <b>{CHAT_MODES[mode]}</b>: {'✅ on' if cfg['active'] == mode else 'off'}, {shown}"
 
 
-def _setchatid_main_view(cfg: Dict[str, Any], notice: Optional[str] = None) -> Tuple[str, InlineKeyboardMarkup]:
+async def _setchatid_paths_view(user_id: int, notice: Optional[str] = None) -> Tuple[str, InlineKeyboardMarkup]:
+    lines = []
+    for path, label in PATH_LABELS.items():
+        cfg = await _get_chat_cfg(user_id, path)
+        if cfg["active"]:
+            state = f"{CHAT_MODES[cfg['active']]} on (<code>{cfg[cfg['active'] + '_id']}</code>)"
+        else:
+            state = "both off"
+        lines.append(f"• <b>{label}</b>: {state}")
     text = (
         "🎯 <b>Target chats</b>\n\n"
+        + "\n".join(lines)
+        + "\n\nEach path has its own Pair and Sell chat. Pick the path to set."
+    )
+    if notice:
+        text = f"{notice}\n\n{text}"
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f"cm_path_{path}")
+                                    for path, label in PATH_LABELS.items()]])
+    return text, markup
+
+
+def _setchatid_main_view(cfg: Dict[str, Any], path: str, notice: Optional[str] = None) -> Tuple[str, InlineKeyboardMarkup]:
+    text = (
+        f"🎯 <b>{PATH_LABELS[path]} chats</b>\n\n"
         + "\n".join(_chat_status_line(cfg, m) for m in CHAT_MODES)
-        + "\n\nOnly one can be on; the one that is on receives the numbers. With both off (or no ID) nothing is "
-        "forwarded, but the bot still takes continue / success / failure from the device.\n"
+        + "\n\nOnly one can be on; the one that is on receives the numbers of this path. With both off (or no ID) "
+        "nothing is forwarded, but the bot still takes continue / success / failure from the device.\n"
         "Tap Pair or Sell to turn it on or off and to set its ID."
     )
     if notice:
         text = f"{notice}\n\n{text}"
-    markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton(("✅ " if cfg["active"] == m else "") + label, callback_data=f"cm_open_{m}")
-        for m, label in CHAT_MODES.items()
-    ]])
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton(("✅ " if cfg["active"] == m else "") + label, callback_data=f"cm_open_{path}_{m}")
+         for m, label in CHAT_MODES.items()],
+        [InlineKeyboardButton("🔙 Back", callback_data="cm_paths")],
+    ])
     return text, markup
 
 
-def _setchatid_mode_view(cfg: Dict[str, Any], mode: str, notice: Optional[str] = None) -> Tuple[str, InlineKeyboardMarkup]:
+def _setchatid_mode_view(cfg: Dict[str, Any], path: str, mode: str, notice: Optional[str] = None) -> Tuple[str, InlineKeyboardMarkup]:
     label = CHAT_MODES[mode]
     chat_id = cfg[f"{mode}_id"]
     on = cfg["active"] == mode
     text = (
-        f"🎯 <b>{label} chat</b>\n\n"
+        f"🎯 <b>{PATH_LABELS[path]} • {label} chat</b>\n\n"
         f"Status: {'✅ on' if on else 'off'}\n"
         f"ID: {f'<code>{chat_id}</code>' if chat_id else 'not set'}\n\n"
-        f"{_mode_how(mode)}"
+        f"{_mode_how(mode, path)}"
     )
     if notice:
         text = f"{notice}\n\n{text}"
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔴 Turn off" if on else "🟢 Turn on", callback_data=f"cm_tog_{mode}")],
-        [InlineKeyboardButton("✏️ Change ID" if chat_id else "➕ Set ID", callback_data=f"cm_id_{mode}")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="cm_main")],
+        [InlineKeyboardButton("🔴 Turn off" if on else "🟢 Turn on", callback_data=f"cm_tog_{path}_{mode}")],
+        [InlineKeyboardButton("✏️ Change ID" if chat_id else "➕ Set ID", callback_data=f"cm_id_{path}_{mode}")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"cm_path_{path}")],
     ])
     return text, markup
 
@@ -4162,8 +4323,7 @@ def _setchatid_mode_view(cfg: Dict[str, Any], mode: str, notice: Optional[str] =
 async def setchatid_handler(message: Message):
     user_id = message.from_user.id
     user_data_store.get(user_id, {}).pop('prompt', None)
-    cfg = await _get_chat_cfg(user_id)
-    text, markup = _setchatid_main_view(cfg)
+    text, markup = await _setchatid_paths_view(user_id)
     await message.answer(text, parse_mode="HTML", reply_markup=markup)
 
 
@@ -4171,7 +4331,6 @@ async def setchatid_handler(message: Message):
 async def chatmode_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
     data = callback.data or ""
-    cfg = await _get_chat_cfg(user_id)
 
     async def show(view: Tuple[str, InlineKeyboardMarkup]) -> None:
         try:
@@ -4179,22 +4338,34 @@ async def chatmode_callback(callback: CallbackQuery):
         except TelegramBadRequest:
             pass
 
-    if data == "cm_main":
+    parts = data[len("cm_"):].split("_")            # e.g. "tog_telegram_pair"
+    action = parts[0]
+    if action == "paths":
         await callback.answer()
-        await show(_setchatid_main_view(cfg))
+        await show(await _setchatid_paths_view(user_id))
         return
-    action, _, mode = data[len("cm_"):].partition("_")
+    if len(parts) < 2 or parts[1] not in PATH_IDENTIFIERS:
+        await callback.answer()
+        return
+    path = parts[1]
+    cfg = await _get_chat_cfg(user_id, path)
+    if action == "path":
+        await callback.answer()
+        await show(_setchatid_main_view(cfg, path))
+        return
+    mode = parts[2] if len(parts) > 2 else ""
     if mode not in CHAT_MODES:
         await callback.answer()
         return
     label = CHAT_MODES[mode]
+    running_here = _batch_running_on(user_id, path)
 
     if action == "open":
         await callback.answer()
-        await show(_setchatid_mode_view(cfg, mode))
+        await show(_setchatid_mode_view(cfg, path, mode))
     elif action == "tog":
-        if is_processing:
-            await callback.answer("A batch is running. Use /stop first, then change the chats.", show_alert=True)
+        if running_here:
+            await callback.answer("A batch is running on this path. Use /stop first, then change its chats.", show_alert=True)
             return
         if cfg["active"] == mode:
             cfg["active"] = None
@@ -4208,21 +4379,21 @@ async def chatmode_callback(callback: CallbackQuery):
             if cfg["active"] == other:
                 notice += f" {CHAT_MODES[other]} was turned off too (only one can be on)."
             cfg["active"] = mode
-        if not await _save_chat_cfg(user_id, cfg):
+        if not await _save_chat_cfg(user_id, path, cfg):
             notice += "\n⚠️ It could not be saved to the database, so it will be lost on restart."
         await update_result_handler_for_user(user_id)
         await callback.answer(notice.split("\n")[0])
-        await show(_setchatid_mode_view(cfg, mode, notice))
+        await show(_setchatid_mode_view(cfg, path, mode, notice))
     elif action == "id":
-        if is_processing and cfg["active"] == mode:
+        if running_here and cfg["active"] == mode:
             await callback.answer("A batch is running on this chat. Use /stop first.", show_alert=True)
             return
         chat_id = cfg[f"{mode}_id"]
         shown = f"<code>{chat_id}</code>" if chat_id else "not set (empty)"
-        user_data_store.setdefault(user_id, {})['prompt'] = {"kind": "setchatid", "mode": mode, "ts": time.time()}
+        user_data_store.setdefault(user_id, {})['prompt'] = {"kind": "setchatid", "path": path, "mode": mode, "ts": time.time()}
         await callback.answer()
         await callback.message.answer(
-            f"🎯 <b>{label} chat ID</b>\n\n"
+            f"🎯 <b>{PATH_LABELS[path]} • {label} chat ID</b>\n\n"
             f"Current: {shown}\n\n"
             "Send the chat ID (like <code>-1001234567890</code>), or send <code>None</code> to leave it empty.\n"
             "Need the ID? Tap <b>Get chat IDs</b> (the same as /getallid), then send the ID here.",
@@ -4996,11 +5167,10 @@ async def _otp_stage(num_msg, user_id: int, num: str, otp_set_name: Optional[str
         return "pause"
 
     async def switched() -> str:
-        await _device_switch_notice(num_msg, num)
-        return "switch"
+        return await _perform_action(num_msg, user_id, num, "switch")
 
     async def saved() -> str:
-        return await _device_save(num_msg, user_id, num)
+        return await _perform_action(num_msg, user_id, num, "save")
 
     if device_deadline - _clock() <= 0:
         return await finish(f"🟠 Ended (Device timeout - {DEVICE_STATE_WAIT_SECONDS // 60} mins)", "device_timeout", timed_out=True)
@@ -5312,7 +5482,9 @@ async def _run_saved_interjection() -> None:
     previous_path, previous_number = active_path, active_number
     active_path = req["path"]
     try:
-        chat_mode, target_chat = await _get_active_chat(user_id)
+        chat_mode, target_chat = await _get_active_chat(user_id, req["path"])
+        if target_chat and result_live_handler_chat.get(user_id) != target_chat:
+            await update_result_handler_for_user(user_id, req["path"])        # the Saved file's path may watch another chat
         numbers = req["numbers"]
         await message.answer(
             f"▶️ Running the next {len(numbers)} number(s) of {req['file_name']} on the second device "
@@ -5343,6 +5515,10 @@ async def _run_saved_interjection() -> None:
         active_path, active_number = previous_path, previous_number
         skip_current_number = False
         saved_interjection_running = False
+        try:
+            await update_result_handler_for_user(user_id)                    # back to the chat of the batch that was paused
+        except Exception:
+            logger.warning("Could not restore the result watcher after the Saved file run")
         if req["resume_after"]:
             is_paused = False
             pause_event.set()
@@ -5416,6 +5592,8 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
     clear; the batch counts these in a row), and None for every other ending.
     """
     global device_status, current_num_msg, current_num
+    if _telegram_path():
+        chat_mode = "sell" if target_chat else None      # Pair and Sell work the same way on the Telegram path for now
     num_msg = await message.answer(f"{num} ⏳ Checking on device...")
     _reset_number_clock()
     current_num_msg, current_num = num_msg, num      # a waittime from the device shows (and waits) here
@@ -5455,11 +5633,9 @@ async def _process_number_once(message: Message, user_id: int, target_chat: Opti
         return "pause"
 
     action = _action_from_status(result_text)
-    if action == "switch":
-        await _device_switch_notice(num_msg, num)
-        return "switch"
-    if action == "save":
-        return await _device_save(num_msg, user_id, num)
+    if action in ("switch", "save"):
+        acted = await _perform_action(num_msg, user_id, num, action)
+        return acted if acted in ("switch", "saved") else None
 
     if "blocked" in result_text:
         await _safe_edit(num_msg, f"{num} ⚫ Bad Num")
@@ -5753,7 +5929,7 @@ async def run_batch(message: Message, user_id: int, numbers: List[str],
             )
             return
 
-        chat_mode, target_chat = await _get_active_chat(user_id)   # the chat that is on (None = both off: nothing is forwarded)
+        chat_mode, target_chat = await _get_active_chat(user_id, active_path)   # the chat that is on for the path (None = both off)
 
         # make sure the live SUCCESS/FAILED handler is watching the current target chat
         if target_chat and result_live_handler_chat.get(user_id) != target_chat:
@@ -6243,8 +6419,9 @@ async def prompt_text_handler(message: Message):
         result = await _try_jump(message, message.text, retry=True)
         done = result != "invalid"
     else:
-        mode = user_data_store[user_id]['prompt'].get("mode") or "sell"
-        result = await _try_setchatid(message, message.text, mode, retry=True)
+        prompt = user_data_store[user_id]['prompt']
+        result = await _try_setchatid(message, message.text, prompt.get("path") or "whatsapp",
+                                      prompt.get("mode") or "sell", retry=True)
         done = result == "ok"
     if done:
         user_data_store.get(user_id, {}).pop('prompt', None)
